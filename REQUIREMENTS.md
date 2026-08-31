@@ -5,10 +5,10 @@
 | 条件 | 実装 | 確認 |
 | --- | --- | --- |
 | 1. following を cursor 分割同期 | `syncFollowingPage`（`/2/profile/{handle}/following`） | pathname、cursor 2 ページ、D1 local migration |
-| 2. 保存済みアカウントを since 収集、返信を除外 | `collectAccountStatuses`、`normalizeStatus` | `since`、`with_replies` 未指定、返信除外、204成功と時刻更新、status cursor の再開と失敗時保持を確認 |
+| 2. 保存済みアカウントを since 収集、返信を除外 | `collectAccountStatuses`、`normalizeStatus` | `since`、`with_replies` 未指定、返信除外、204成功と時刻更新、`retweets`→`reposts`、status cursor の再開と失敗時保持を確認 |
 | 3. enabled query を latest 収集 | `collectSearchQueries`、`saveQueryPosts` | `feed=latest`、空404成功、検索語ごとの cursor 継続・query変更時リセット、最終ページ成功時の checkpoint、成功可否に依存しない巡回位置を確認 |
 | 4. 投稿 ID 主キー、quote 保存 | migration の `posts.id`、`postStatement` | following/searchの同一ID 1件保存、`quote_json` を確認 |
-| 5. Cron、checkpoint、実行上限 | `scheduled`、`collectOnce`、`collector_state` | Cron、scheduled handler、24時間再同期、SOURCE_HANDLE変更時の再開、空SOURCE_HANDLE時のstatus停止、status/query の巡回、失敗batchの巡回、typecheck、Vitest |
+| 5. Cron、checkpoint、実行上限 | `scheduled`、`collectOnce`、`collector_state` | Cron、scheduled handler、24時間再同期、SOURCE_HANDLE変更時の再開と完了前status停止、空SOURCE_HANDLE時のstatus停止、status/query の巡回、失敗batchの巡回、typecheck、Vitest |
 | 6. `/feed` の pagination・hours・ISO・降順 | `feed` | `generated_at` / `posts`、ページング、hours、`created_at`、ID同率順、quote、不正paginationを確認 |
 | 7. ChatGPT 向け安定 JSON | `feed` の `generated_at` / `posts` envelope | Worker fetch の JSON テスト、README の payload 例 |
 | 8. 推薦ロジックを入れない | `src/index.ts` に推薦処理なし | README の責務境界 |

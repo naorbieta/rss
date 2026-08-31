@@ -75,6 +75,7 @@ const MAX_FOLLOWING_UPSERTS_PER_BATCH = 50;
 const FOLLOWING_RESYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const ACCOUNT_STATUS_STATE_PREFIX = "account_status:";
 const SEARCH_QUERY_STATE_PREFIX = "search_query:";
+const FOLLOWING_PENDING_SOURCE_KEY = "following_pending_source_handle";
 
 function isRecord(value: unknown): value is JsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -135,7 +136,7 @@ export function normalizeStatus(value: unknown): ApiStatus | null {
     text: typeof value.text === "string" ? value.text : "",
     createdTimestamp: timestamp,
     likes: Math.max(0, Math.floor(asNumber(value.likes))),
-    reposts: Math.max(0, Math.floor(asNumber(value.reposts))),
+    reposts: Math.max(0, Math.floor(asNumber(value.retweets ?? value.reposts))),
     quotes: Math.max(0, Math.floor(asNumber(value.quotes))),
     replies: Math.max(0, Math.floor(asNumber(value.replies))),
     author: { id: authorId, screenName, name },
@@ -379,6 +380,7 @@ export async function syncFollowingPage(db: D1Database, sourceHandle: string, no
   const stateStatements: D1PreparedStatement[] = [];
   if (page.cursor) {
     stateStatements.push(stateStatement(db, "following_source_handle", sourceHandle, updatedAt));
+    if (!sameSource) stateStatements.push(stateStatement(db, FOLLOWING_PENDING_SOURCE_KEY, sourceHandle, updatedAt));
     stateStatements.push(stateStatement(db, "following_cursor", page.cursor, updatedAt));
     stateStatements.push(stateStatement(db, "following_marker", marker, updatedAt));
   } else {
@@ -388,6 +390,7 @@ export async function syncFollowingPage(db: D1Database, sourceHandle: string, no
       WHERE key LIKE ?
         AND substr(key, ?) NOT IN (SELECT id FROM accounts WHERE sync_marker = ?)
     `).bind(`${ACCOUNT_STATUS_STATE_PREFIX}%`, ACCOUNT_STATUS_STATE_PREFIX.length + 1, marker));
+    stateStatements.push(db.prepare("DELETE FROM collector_state WHERE key = ?").bind(FOLLOWING_PENDING_SOURCE_KEY));
     stateStatements.push(stateStatement(db, "following_source_handle", sourceHandle, updatedAt));
     stateStatements.push(stateStatement(db, "following_cursor", "", updatedAt));
     stateStatements.push(stateStatement(db, "following_marker", "", updatedAt));
@@ -504,6 +507,12 @@ async function shouldSyncFollowing(db: D1Database, sourceHandle: string, nowMs: 
   return !Number.isFinite(lastSyncMs) || nowMs - lastSyncMs >= FOLLOWING_RESYNC_INTERVAL_MS;
 }
 
+async function canCollectAccountStatuses(db: D1Database, sourceHandle: string): Promise<boolean> {
+  if (await readState(db, "following_source_handle") !== sourceHandle) return false;
+  if (await readState(db, FOLLOWING_PENDING_SOURCE_KEY)) return false;
+  return Boolean(await readState(db, "following_sync_at"));
+}
+
 export async function collectOnce(env: RuntimeEnv, nowMs = Date.now()): Promise<{ following: boolean; accounts: number; queries: number }> {
   const sourceHandle = env.SOURCE_HANDLE.trim();
   let following = false;
@@ -517,7 +526,7 @@ export async function collectOnce(env: RuntimeEnv, nowMs = Date.now()): Promise<
   }
 
   let accounts = 0;
-  if (sourceHandle) {
+  if (sourceHandle && await canCollectAccountStatuses(env.DB, sourceHandle)) {
     try {
       accounts = await collectAccountStatuses(env.DB, nowMs);
     } catch (error) {

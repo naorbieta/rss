@@ -70,6 +70,22 @@ describe("FxEmbed collector", () => {
     expect(normalizeStatus({ ...status, created_timestamp: 1e100 })).toBeNull();
   });
 
+  it("maps the FxEmbed retweets counter to internal reposts", () => {
+    const status = normalizeStatus({
+      id: "101",
+      url: "https://x.com/alice/status/101",
+      text: "本文",
+      created_timestamp: 1_700_000_000,
+      likes: 2,
+      retweets: 7,
+      quotes: 1,
+      replies: 0,
+      author: { id: "a", screen_name: "alice", name: "Alice" },
+      quote: null,
+    });
+    expect(status?.reposts).toBe(7);
+  });
+
   it("collects accounts and queries, excludes replies, and checkpoints each source", async () => {
     await db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("a", "alice", "Alice", 1_699_999_900).run();
     await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("cloudflare").run();
@@ -233,6 +249,37 @@ describe("FxEmbed collector", () => {
     expect((await db.prepare("SELECT id, handle FROM accounts").all<{ id: string; handle: string }>()).results).toEqual([{ id: "new", handle: "new-account" }]);
     expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_source_handle").first<{ value: string }>())?.value).toBe("new-source");
     expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("account_status:old").first<{ count: number }>())?.count).toBe(0);
+  });
+
+  it("does not poll old accounts until a changed source full sync completes", async () => {
+    const timestamp = "2023-11-14T22:00:00.000Z";
+    await db.batch([
+      db.prepare("INSERT INTO accounts (id, handle, name, sync_marker) VALUES (?, ?, ?, ?)").bind("old", "old", "Old", "old-marker"),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_source_handle", "old-source", timestamp),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_cursor", "", timestamp),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_marker", "", timestamp),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_sync_at", timestamp, timestamp),
+    ]);
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { users: [] }, cursor: { bottom: "next" } })))
+      .mockResolvedValueOnce(new Response("upstream failed", { status: 500 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { users: [{ id: "new", screen_name: "new-account", name: "New" }] }, cursor: { bottom: null } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } })));
+    const newRuntimeEnv = { DB: db, SOURCE_HANDLE: "new-source" };
+
+    expect((await collectOnce(newRuntimeEnv, 1_700_000_100_000)).accounts).toBe(0);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM accounts").first<{ count: number }>())?.count).toBe(1);
+    expect((await collectOnce(newRuntimeEnv, 1_700_000_101_000)).accounts).toBe(0);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM accounts").first<{ count: number }>())?.count).toBe(1);
+    const completed = await collectOnce(newRuntimeEnv, 1_700_000_102_000);
+    expect(completed.accounts).toBe(1);
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
+      "/2/profile/new-source/following",
+      "/2/profile/new-source/following",
+      "/2/profile/new-source/following",
+      "/2/profile/new-account/statuses",
+    ]);
+    expect((await db.prepare("SELECT handle FROM accounts").all<{ handle: string }>()).results).toEqual([{ handle: "new-account" }]);
   });
 
   it("treats status 204 as a successful empty check", async () => {
