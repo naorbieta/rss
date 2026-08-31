@@ -1,0 +1,19 @@
+{
+  "name": "rss-curator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "FxEmbed の投稿を D1 に同期するローカル完結 Worker",
+  "type": "module",
+  "scripts": {
+    "types": "wrangler types",
+    "typecheck": "wrangler types && tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.1.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.127.1"
+  }
+}
