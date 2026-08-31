@@ -41,6 +41,7 @@ type AccountStatusCheckpoint = {
 type SearchQueryCheckpoint = {
   query: string;
   backlogCursor: string | null;
+  queuedCursor: string | null;
   stopWatermark: number | null;
   stopIds: string[];
   pendingLatest: number | null;
@@ -319,6 +320,9 @@ async function readSearchQueryCheckpoint(db: D1Database, query: DbQuery): Promis
     const rawCursor = Object.prototype.hasOwnProperty.call(parsed, "backlog_cursor") ? parsed.backlog_cursor : parsed.cursor;
     const backlogCursor = rawCursor === undefined || rawCursor === null ? null : asString(rawCursor);
     if (rawCursor !== undefined && rawCursor !== null && !backlogCursor) return null;
+    const rawQueuedCursor = parsed.queued_cursor;
+    const queuedCursor = rawQueuedCursor === undefined || rawQueuedCursor === null ? null : asString(rawQueuedCursor);
+    if (rawQueuedCursor !== undefined && rawQueuedCursor !== null && !queuedCursor) return null;
     const stopValue = parsed.stop_watermark;
     const pendingValue = parsed.pending_latest;
     const stopIds = readStateIds(parsed.stop_ids);
@@ -327,6 +331,7 @@ async function readSearchQueryCheckpoint(db: D1Database, query: DbQuery): Promis
     return {
       query: query.query,
       backlogCursor,
+      queuedCursor,
       stopWatermark: stopValue === undefined || stopValue === null ? null : asTimestamp(stopValue),
       stopIds,
       pendingLatest: pendingValue === undefined || pendingValue === null ? null : asTimestamp(pendingValue),
@@ -503,6 +508,7 @@ function searchCheckpointValue(query: DbQuery, checkpoint: SearchQueryCheckpoint
   return JSON.stringify({
     query: query.query,
     backlog_cursor: checkpoint.backlogCursor,
+    queued_cursor: checkpoint.queuedCursor,
     stop_watermark: checkpoint.stopWatermark,
     stop_ids: checkpoint.stopIds,
     pending_latest: checkpoint.pendingLatest,
@@ -545,6 +551,7 @@ async function saveSearchLatest(
   let next: SearchQueryCheckpoint = checkpoint ?? {
     query: query.query,
     backlogCursor: null,
+    queuedCursor: null,
     stopWatermark: latest,
     stopIds: statusIdsAtTimestamp(page.statuses, latest),
     pendingLatest: null,
@@ -556,7 +563,16 @@ async function saveSearchLatest(
       ? (checkpoint.pendingLatest === pendingLatest ? mergeIds(checkpoint.pendingLatestIds, statusIdsAtTimestamp(page.statuses, latest)) : statusIdsAtTimestamp(page.statuses, latest))
       : checkpoint.pendingLatestIds;
     if (checkpoint.backlogCursor) {
-      next = { ...checkpoint, pendingLatest, pendingLatestIds };
+      const pendingWatermark = checkpoint.pendingLatest ?? checkpoint.stopWatermark;
+      const pendingIds = checkpoint.pendingLatest !== null && checkpoint.pendingLatest === latest
+        ? checkpoint.pendingLatestIds
+        : checkpoint.pendingLatest === null && checkpoint.stopWatermark === latest ? checkpoint.stopIds : [];
+      const hasNewLatest = latest !== null && (pendingWatermark === null || latest > pendingWatermark ||
+        (latest === pendingWatermark && statusIdsAtTimestamp(page.statuses, latest).some((id) => !pendingIds.includes(id))));
+      const shouldQueue = page.cursor && hasNewLatest && page.cursor !== checkpoint.backlogCursor && page.cursor !== checkpoint.queuedCursor;
+      next = shouldQueue
+        ? { ...checkpoint, queuedCursor: page.cursor, pendingLatest, pendingLatestIds }
+        : { ...checkpoint, pendingLatest, pendingLatestIds };
     } else if (
       latest !== null && page.cursor &&
       (checkpoint.stopWatermark === null || latest > checkpoint.stopWatermark ||
@@ -567,6 +583,7 @@ async function saveSearchLatest(
       const stopWatermark = Math.max(checkpoint.stopWatermark ?? 0, pendingLatest ?? 0) || null;
       next = {
         ...checkpoint,
+        queuedCursor: null,
         stopWatermark,
         stopIds: idsForTimestamp(stopWatermark,
           { timestamp: checkpoint.stopWatermark, ids: checkpoint.stopIds },
@@ -600,24 +617,28 @@ async function saveSearchBacklog(
   const reachedStop = checkpoint.stopWatermark !== null && oldest !== null &&
     (oldest < checkpoint.stopWatermark || (oldest === checkpoint.stopWatermark && pageIdsAtStop.some((id) => checkpoint.stopIds.includes(id))));
   const complete = page.cursor === null || reachedStop;
+  const reachedQueuedCursor = page.cursor !== null && page.cursor === checkpoint.queuedCursor;
   const pendingLatest = Math.max(checkpoint.pendingLatest ?? 0, latest ?? 0) || null;
   const pendingLatestIds = latest !== null && latest === pendingLatest
     ? (checkpoint.pendingLatest === pendingLatest ? mergeIds(checkpoint.pendingLatestIds, statusIdsAtTimestamp(page.statuses, latest)) : statusIdsAtTimestamp(page.statuses, latest))
     : checkpoint.pendingLatestIds;
-  const next: SearchQueryCheckpoint = complete
-    ? {
-        query: query.query,
-        backlogCursor: null,
-        stopWatermark: Math.max(checkpoint.stopWatermark ?? 0, pendingLatest ?? 0) || null,
-        stopIds: idsForTimestamp(Math.max(checkpoint.stopWatermark ?? 0, pendingLatest ?? 0) || null,
-          { timestamp: checkpoint.stopWatermark, ids: checkpoint.stopIds },
-          { timestamp: checkpoint.pendingLatest, ids: checkpoint.pendingLatestIds },
-          { timestamp: pendingLatest, ids: pendingLatestIds },
-        ),
-        pendingLatest: null,
-        pendingLatestIds: [],
-      }
-    : { ...checkpoint, backlogCursor: page.cursor, pendingLatest, pendingLatestIds };
+  const next: SearchQueryCheckpoint = complete && checkpoint.queuedCursor
+    ? { ...checkpoint, backlogCursor: checkpoint.queuedCursor, queuedCursor: null, pendingLatest, pendingLatestIds }
+    : complete
+      ? {
+          query: query.query,
+          backlogCursor: null,
+          queuedCursor: null,
+          stopWatermark: Math.max(checkpoint.stopWatermark ?? 0, pendingLatest ?? 0) || null,
+          stopIds: idsForTimestamp(Math.max(checkpoint.stopWatermark ?? 0, pendingLatest ?? 0) || null,
+            { timestamp: checkpoint.stopWatermark, ids: checkpoint.stopIds },
+            { timestamp: checkpoint.pendingLatest, ids: checkpoint.pendingLatestIds },
+            { timestamp: pendingLatest, ids: pendingLatestIds },
+          ),
+          pendingLatest: null,
+          pendingLatestIds: [],
+        }
+      : { ...checkpoint, backlogCursor: page.cursor, queuedCursor: reachedQueuedCursor ? null : checkpoint.queuedCursor, pendingLatest, pendingLatestIds };
   const statements: D1PreparedStatement[] = [];
   const posts = postsStatement(db, page.statuses, "search", query.query, checkedAt);
   if (posts) statements.push(posts);

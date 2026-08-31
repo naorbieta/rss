@@ -956,6 +956,7 @@ describe("FxEmbed collector", () => {
     expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind(`search_query:${queryId}`).first<{ value: string }>())?.value ?? "null")).toEqual({
       query: "empty-then-new",
       backlog_cursor: null,
+      queued_cursor: null,
       stop_watermark: 1_700_000_005,
       stop_ids: ["new-latest-5"],
       pending_latest: null,
@@ -1025,6 +1026,7 @@ describe("FxEmbed collector", () => {
     expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind(`search_query:${queryId}`).first<{ value: string }>())?.value ?? "null")).toEqual({
       query: "cursor-query",
       backlog_cursor: "search-page-3",
+      queued_cursor: "latest-cursor-1",
       stop_watermark: 1_699_999_900,
       stop_ids: [],
       pending_latest: 1_700_000_001,
@@ -1055,13 +1057,42 @@ describe("FxEmbed collector", () => {
     expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE id = ?").bind(queryId).first<{ last_checked_at: string }>())?.last_checked_at).toBe("2023-11-14T22:15:01.000Z");
     expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind(`search_query:${queryId}`).first<{ value: string }>())?.value ?? "null")).toEqual({
       query: "cursor-query",
+      backlog_cursor: "latest-cursor-2",
+      queued_cursor: null,
+      stop_watermark: 1_699_999_900,
+      stop_ids: [],
+      pending_latest: 1_700_000_002,
+      pending_latest_ids: ["latest-2"],
+    });
+    expect((await db.prepare("SELECT id FROM posts ORDER BY id").all<{ id: string }>()).results.map((post) => post.id)).toEqual(["latest-1", "latest-2", "search-1", "search-2", "search-boundary"]);
+
+    fetchMock.mockImplementationOnce(async (input) => {
+      const parsed = new URL(String(input));
+      expect(parsed.searchParams.get("cursor")).toBeNull();
+      return new Response(JSON.stringify({ results: { timeline: [
+        { id: "latest-2", url: "https://x.com/a/status/latest-2", text: "latest 2", created_timestamp: 1_700_000_002, author: { id: "a", screen_name: "alice", name: "Alice" } },
+      ] }, cursor: { bottom: "latest-cursor-2" } }));
+    });
+    fetchMock.mockImplementationOnce(async (input) => {
+      const parsed = new URL(String(input));
+      expect(parsed.searchParams.get("cursor")).toBe("latest-cursor-2");
+      return new Response(JSON.stringify({ results: { timeline: [
+        { id: "queued-new", url: "https://x.com/a/status/queued-new", text: "queued new", created_timestamp: 1_699_999_800, author: { id: "a", screen_name: "alice", name: "Alice" } },
+      ] }, cursor: { bottom: null } }));
+    });
+    await collectOnce(runtimeEnv, 1_700_000_102_000);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(6);
+    expect((await db.prepare("SELECT id FROM posts WHERE id = ?").bind("queued-new").first<{ id: string }>())?.id).toBe("queued-new");
+    const idleState = JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind(`search_query:${queryId}`).first<{ value: string }>())?.value ?? "null");
+    expect(idleState).toEqual({
+      query: "cursor-query",
       backlog_cursor: null,
+      queued_cursor: null,
       stop_watermark: 1_700_000_002,
       stop_ids: ["latest-2"],
       pending_latest: null,
       pending_latest_ids: [],
     });
-    expect((await db.prepare("SELECT id FROM posts ORDER BY id").all<{ id: string }>()).results.map((post) => post.id)).toEqual(["latest-1", "latest-2", "search-1", "search-2", "search-boundary"]);
 
     fetchMock.mockImplementationOnce(async (input) => {
       const parsed = new URL(String(input));
@@ -1071,8 +1102,10 @@ describe("FxEmbed collector", () => {
         { id: "latest-2", url: "https://x.com/a/status/latest-2", text: "latest 2", created_timestamp: 1_700_000_002, author: { id: "a", screen_name: "alice", name: "Alice" } },
       ] }, cursor: { bottom: "should-not-start-backlog" } }));
     });
-    await collectOnce(runtimeEnv, 1_700_000_102_000);
-    expect(fetchMock).toHaveBeenCalledTimes(5);
+    await collectOnce(runtimeEnv, 1_700_000_103_000);
+    expect(fetchMock).toHaveBeenCalledTimes(7);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(6);
+    expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind(`search_query:${queryId}`).first<{ value: string }>())?.value ?? "null")).toEqual(idleState);
   });
 
   it("starts a backlog only when a newer latest page has a cursor", async () => {

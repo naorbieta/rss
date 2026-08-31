@@ -28,7 +28,7 @@ Wrangler の設定値を変更したら `npm run types` をもう一度実行し
 npx wrangler d1 execute rss-curator --local --command "INSERT INTO search_queries (query) VALUES ('cloudflare')"
 ```
 
-無効化・再有効化は `enabled` を `0`・`1` に更新します。Cron 1 回につき、保存済みの巡回位置から最大 3 件を処理します。各検索語は毎回 cursor なしの `feed=latest` を先に 1 ページ取得して保存し、途中の backlog cursor があれば続けて 1 ページ取得します。latest の取得成功時に `last_checked_at` を更新し、backlog 用 cursor は別の `collector_state` に保存します。最新ページで確認した投稿時刻が前回完了時の stop watermark より新しいとき、または同じ秒の未確認 ID があるときだけ backlog を開始し、stop watermark の既知 ID に到達するか終端になるまで続けます。巡回位置は成功・失敗にかかわらず進みます。`search_queries.query` を変更すると、古い state を使わず初回ページから再開します。
+無効化・再有効化は `enabled` を `0`・`1` に更新します。Cron 1 回につき、保存済みの巡回位置から最大 3 件を処理します。各検索語は毎回 cursor なしの `feed=latest` を先に 1 ページ取得して保存し、途中の backlog cursor があれば続けて 1 ページ取得します。latest の取得成功時に `last_checked_at` を更新し、backlog 用 cursor は別の `collector_state` に保存します。backlog 中に fresh で新しい cursor が見つかった場合は `queued_cursor` に待機させ、現在の backlog が終端または stop watermark に到達してから切り替えます。最新ページで確認した投稿時刻が前回完了時の stop watermark より新しいとき、または同じ秒の未確認 ID があるときだけ backlog を開始し、stop watermark の既知 ID に到達するか終端になるまで続けます。巡回位置は成功・失敗にかかわらず進みます。`search_queries.query` を変更すると、古い state を使わず初回ページから再開します。
 
 ## 収集を動かす
 
