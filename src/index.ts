@@ -31,10 +31,11 @@ type DbAccount = {
 };
 
 type AccountStatusCheckpoint = {
-  cursor: string;
+  cursor: string | null;
   queuedCursor: string | null;
   since: number | null;
   latest: number | null;
+  latestIds: string[];
 };
 
 type SearchQueryCheckpoint = {
@@ -276,15 +277,22 @@ async function readAccountStatusCheckpoint(db: D1Database, accountId: string): P
   try {
     const parsed: unknown = JSON.parse(value);
     if (!isRecord(parsed)) return null;
-    const cursor = asString(parsed.cursor);
-    if (!cursor) return null;
+    const rawCursor = parsed.cursor;
+    const cursor = rawCursor === undefined || rawCursor === null ? null : asString(rawCursor);
+    if (rawCursor !== undefined && rawCursor !== null && !cursor) return null;
+    const rawQueuedCursor = parsed.queued_cursor;
+    const queuedCursor = rawQueuedCursor === undefined || rawQueuedCursor === null ? null : asString(rawQueuedCursor);
+    if (rawQueuedCursor !== undefined && rawQueuedCursor !== null && !queuedCursor) return null;
     const sinceValue = parsed.since;
     const latestValue = parsed.latest;
+    const latestIds = readStateIds(parsed.latest_ids);
+    if (!latestIds) return null;
     return {
       cursor,
-      queuedCursor: parsed.queued_cursor === undefined || parsed.queued_cursor === null ? null : asString(parsed.queued_cursor),
-      since: sinceValue === null ? null : asTimestamp(sinceValue),
-      latest: latestValue === null ? null : asTimestamp(latestValue),
+      queuedCursor,
+      since: sinceValue === undefined || sinceValue === null ? null : asTimestamp(sinceValue),
+      latest: latestValue === undefined || latestValue === null ? null : asTimestamp(latestValue),
+      latestIds,
     };
   } catch {
     return null;
@@ -372,6 +380,7 @@ function accountCheckpointValue(checkpoint: AccountStatusCheckpoint): string {
     queued_cursor: checkpoint.queuedCursor,
     since: checkpoint.since,
     latest: checkpoint.latest,
+    latest_ids: checkpoint.latestIds,
   });
 }
 
@@ -383,6 +392,13 @@ function latestTimestamp(account: DbAccount, checkpoint: AccountStatusCheckpoint
   return latest || null;
 }
 
+function latestAccountIds(account: DbAccount, checkpoint: AccountStatusCheckpoint | null, page: ApiStatus[], latest: number | null): string[] {
+  const pageIds = statusIdsAtTimestamp(page, latest);
+  if (checkpoint?.latest === latest) return mergeIds(checkpoint.latestIds, pageIds);
+  if (!checkpoint && account.last_post_timestamp === latest) return pageIds;
+  return pageIds;
+}
+
 async function saveAccountFresh(
   db: D1Database,
   account: DbAccount,
@@ -390,38 +406,53 @@ async function saveAccountFresh(
   page: { statuses: ApiStatus[]; cursor: string | null },
   since: number | null,
   checkedAt: string,
-): Promise<AccountStatusCheckpoint | null> {
+): Promise<AccountStatusCheckpoint> {
   const latest = latestTimestamp(account, checkpoint, page.statuses);
+  const latestIds = latestAccountIds(account, checkpoint, page.statuses, latest);
   const statements: D1PreparedStatement[] = [];
   const posts = postsStatement(db, page.statuses.filter((post) => !post.isReply), "following", account.handle, checkedAt);
   if (posts) statements.push(posts);
   const stateKey = accountStatusStateKey(account.id);
-  let next: AccountStatusCheckpoint | null = null;
-  if (checkpoint) {
+  let next: AccountStatusCheckpoint;
+  if (checkpoint?.cursor) {
     const queuedCursor = page.cursor === null
       ? checkpoint.queuedCursor
       : page.cursor === checkpoint.cursor ? checkpoint.queuedCursor : page.cursor;
-    next = { ...checkpoint, queuedCursor, latest };
+    next = { ...checkpoint, queuedCursor, latest, latestIds };
   } else if (account.last_post_timestamp === null) {
     const baseline = Math.floor(Date.parse(checkedAt) / 1000);
     const initialLatest = latest ?? (Number.isFinite(baseline) && baseline > 0 ? baseline : null);
-    statements.push(db.prepare("UPDATE accounts SET last_post_timestamp = CASE WHEN ? > 0 THEN ? ELSE last_post_timestamp END, last_checked_at = ? WHERE id = ?").bind(initialLatest ?? 0, initialLatest, checkedAt, account.id));
-  } else if (page.cursor && latest !== null && latest > account.last_post_timestamp) {
-    next = { cursor: page.cursor, queuedCursor: null, since: account.last_post_timestamp, latest };
+    next = { cursor: null, queuedCursor: null, since: null, latest: initialLatest, latestIds: initialLatest === latest ? latestIds : [] };
+  } else {
+    const watermark = checkpoint?.latest ?? account.last_post_timestamp;
+    const hasNew = latest !== null && watermark !== null && (
+      latest > watermark ||
+      (latest === watermark && latestIds.some((id) => !((checkpoint?.latestIds ?? []).includes(id))))
+    );
+    if (page.cursor && hasNew) {
+      next = { cursor: page.cursor, queuedCursor: null, since: checkpoint?.since ?? account.last_post_timestamp, latest, latestIds };
+    } else {
+      const nextLatest = Math.max(account.last_post_timestamp, latest ?? 0) || null;
+      next = {
+        cursor: null,
+        queuedCursor: null,
+        since: null,
+        latest: nextLatest,
+        latestIds: nextLatest === latest ? latestIds : checkpoint?.latestIds ?? [],
+      };
+    }
+  }
+  if (next.cursor) {
+    statements.push(db.prepare("UPDATE accounts SET last_checked_at = ? WHERE id = ?").bind(checkedAt, account.id));
   } else {
     statements.push(db.prepare(`
       UPDATE accounts
       SET last_post_timestamp = CASE WHEN ? > COALESCE(last_post_timestamp, 0) THEN ? ELSE last_post_timestamp END,
           last_checked_at = ?
       WHERE id = ?
-    `).bind(latest ?? 0, latest, checkedAt, account.id));
+    `).bind(next.latest ?? 0, next.latest, checkedAt, account.id));
   }
-  if (next) {
-    statements.push(db.prepare("UPDATE accounts SET last_checked_at = ? WHERE id = ?").bind(checkedAt, account.id));
-    statements.push(stateStatement(db, stateKey, accountCheckpointValue(next), checkedAt));
-  } else {
-    statements.push(db.prepare("DELETE FROM collector_state WHERE key = ?").bind(stateKey));
-  }
+  statements.push(stateStatement(db, stateKey, accountCheckpointValue(next), checkedAt));
   await db.batch(statements);
   return next;
 }
@@ -432,37 +463,38 @@ async function saveAccountBacklog(
   checkpoint: AccountStatusCheckpoint,
   page: { statuses: ApiStatus[]; cursor: string | null },
   checkedAt: string,
-): Promise<AccountStatusCheckpoint | null> {
+): Promise<AccountStatusCheckpoint> {
   const latest = latestTimestamp(account, checkpoint, page.statuses);
+  const latestIds = latestAccountIds(account, checkpoint, page.statuses, latest);
   const statements: D1PreparedStatement[] = [];
   const posts = postsStatement(db, page.statuses.filter((post) => !post.isReply), "following", account.handle, checkedAt);
   if (posts) statements.push(posts);
   const stateKey = accountStatusStateKey(account.id);
-  let next: AccountStatusCheckpoint | null;
+  let next: AccountStatusCheckpoint;
   if (page.cursor) {
     next = {
       ...checkpoint,
       cursor: page.cursor,
       queuedCursor: page.cursor === checkpoint.queuedCursor ? null : checkpoint.queuedCursor,
       latest,
+      latestIds,
     };
   } else if (checkpoint.queuedCursor) {
-    next = { cursor: checkpoint.queuedCursor, queuedCursor: null, since: checkpoint.since, latest };
+    next = { cursor: checkpoint.queuedCursor, queuedCursor: null, since: checkpoint.since, latest, latestIds };
   } else {
-    next = null;
+    next = { cursor: null, queuedCursor: null, since: null, latest, latestIds };
   }
-  if (next) {
+  if (next.cursor) {
     statements.push(db.prepare("UPDATE accounts SET last_checked_at = ? WHERE id = ?").bind(checkedAt, account.id));
-    statements.push(stateStatement(db, stateKey, accountCheckpointValue(next), checkedAt));
   } else {
     statements.push(db.prepare(`
       UPDATE accounts
       SET last_post_timestamp = CASE WHEN ? > COALESCE(last_post_timestamp, 0) THEN ? ELSE last_post_timestamp END,
           last_checked_at = ?
       WHERE id = ?
-    `).bind(latest ?? 0, latest, checkedAt, account.id));
-    statements.push(db.prepare("DELETE FROM collector_state WHERE key = ?").bind(stateKey));
+    `).bind(next.latest ?? 0, next.latest, checkedAt, account.id));
   }
+  statements.push(stateStatement(db, stateKey, accountCheckpointValue(next), checkedAt));
   await db.batch(statements);
   return next;
 }
@@ -679,7 +711,7 @@ async function collectAccountStatuses(db: D1Database, nowMs: number): Promise<nu
     }
     try {
       const checkpoint = await readAccountStatusCheckpoint(db, account.id);
-      const since = checkpoint ? checkpoint.since : account.last_post_timestamp;
+      const since = checkpoint?.since ?? account.last_post_timestamp;
       let nextCheckpoint = checkpoint;
       let freshSucceeded = false;
       try {
