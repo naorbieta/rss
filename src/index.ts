@@ -32,6 +32,7 @@ type DbAccount = {
 
 type AccountStatusCheckpoint = {
   cursor: string;
+  queuedCursor: string | null;
   since: number | null;
   latest: number | null;
 };
@@ -40,7 +41,9 @@ type SearchQueryCheckpoint = {
   query: string;
   backlogCursor: string | null;
   stopWatermark: number | null;
+  stopIds: string[];
   pendingLatest: number | null;
+  pendingLatestIds: string[];
 };
 
 type DbQuery = {
@@ -74,10 +77,10 @@ const FETCH_TIMEOUT_MS = 10_000;
 const FOLLOWING_API_COUNT = 20;
 const STATUS_API_COUNT = 6;
 const SEARCH_API_COUNT = 6;
-const MAX_ACCOUNTS_PER_RUN = 3;
+const MAX_ACCOUNTS_PER_RUN = 2;
 const MAX_QUERIES_PER_RUN = 3;
 const FOLLOWING_RESYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
-// No-following runs make at most 9 upstream requests (3 accounts + 3 queries × fresh/backlog), so 90 seconds at timeout; the 10-minute lease is ample and below the 15-minute Cron interval.
+// No-following runs make at most 10 upstream requests (2 accounts + 3 queries, each fresh/backlog), so 100 seconds at timeout; the 10-minute lease is ample and below the 15-minute Cron interval.
 const COLLECTION_LEASE_MS = 10 * 60 * 1000;
 const ACCOUNT_STATUS_STATE_PREFIX = "account_status:";
 const SEARCH_QUERY_STATE_PREFIX = "search_query:";
@@ -279,12 +282,20 @@ async function readAccountStatusCheckpoint(db: D1Database, accountId: string): P
     const latestValue = parsed.latest;
     return {
       cursor,
+      queuedCursor: parsed.queued_cursor === undefined || parsed.queued_cursor === null ? null : asString(parsed.queued_cursor),
       since: sinceValue === null ? null : asTimestamp(sinceValue),
       latest: latestValue === null ? null : asTimestamp(latestValue),
     };
   } catch {
     return null;
   }
+}
+
+function readStateIds(value: unknown): string[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return null;
+  const ids = value.map(asId);
+  return ids.every((id): id is string => id !== null) ? [...new Set(ids)] : null;
 }
 
 function searchQueryStateKey(queryId: number): string {
@@ -302,11 +313,16 @@ async function readSearchQueryCheckpoint(db: D1Database, query: DbQuery): Promis
     if (rawCursor !== undefined && rawCursor !== null && !backlogCursor) return null;
     const stopValue = parsed.stop_watermark;
     const pendingValue = parsed.pending_latest;
+    const stopIds = readStateIds(parsed.stop_ids);
+    const pendingLatestIds = readStateIds(parsed.pending_latest_ids);
+    if (!stopIds || !pendingLatestIds) return null;
     return {
       query: query.query,
       backlogCursor,
       stopWatermark: stopValue === undefined || stopValue === null ? null : asTimestamp(stopValue),
+      stopIds,
       pendingLatest: pendingValue === undefined || pendingValue === null ? null : asTimestamp(pendingValue),
+      pendingLatestIds,
     };
   } catch {
     return null;
@@ -350,35 +366,103 @@ function postsStatement(
   `).bind(...values);
 }
 
-async function saveAccountPosts(
+function accountCheckpointValue(checkpoint: AccountStatusCheckpoint): string {
+  return JSON.stringify({
+    cursor: checkpoint.cursor,
+    queued_cursor: checkpoint.queuedCursor,
+    since: checkpoint.since,
+    latest: checkpoint.latest,
+  });
+}
+
+function latestTimestamp(account: DbAccount, checkpoint: AccountStatusCheckpoint | null, page: ApiStatus[]): number | null {
+  const latest = page.reduce(
+    (max, post) => Math.max(max, post.createdTimestamp),
+    Math.max(account.last_post_timestamp ?? 0, checkpoint?.latest ?? 0),
+  );
+  return latest || null;
+}
+
+async function saveAccountFresh(
   db: D1Database,
   account: DbAccount,
   checkpoint: AccountStatusCheckpoint | null,
   page: { statuses: ApiStatus[]; cursor: string | null },
   since: number | null,
   checkedAt: string,
-): Promise<void> {
-  const latest = page.statuses.reduce(
-    (max, post) => Math.max(max, post.createdTimestamp),
-    Math.max(account.last_post_timestamp ?? 0, checkpoint?.latest ?? 0),
-  );
+): Promise<AccountStatusCheckpoint | null> {
+  const latest = latestTimestamp(account, checkpoint, page.statuses);
   const statements: D1PreparedStatement[] = [];
   const posts = postsStatement(db, page.statuses.filter((post) => !post.isReply), "following", account.handle, checkedAt);
   if (posts) statements.push(posts);
   const stateKey = accountStatusStateKey(account.id);
-  if (page.cursor) {
-    statements.push(db.prepare("UPDATE accounts SET last_checked_at = ? WHERE id = ?").bind(checkedAt, account.id));
-    statements.push(stateStatement(db, stateKey, JSON.stringify({ cursor: page.cursor, since, latest: latest || null }), checkedAt));
+  let next: AccountStatusCheckpoint | null = null;
+  if (checkpoint) {
+    const queuedCursor = page.cursor === null
+      ? checkpoint.queuedCursor
+      : page.cursor === checkpoint.cursor ? checkpoint.queuedCursor : page.cursor;
+    next = { ...checkpoint, queuedCursor, latest };
+  } else if (account.last_post_timestamp === null) {
+    statements.push(db.prepare("UPDATE accounts SET last_post_timestamp = CASE WHEN ? > 0 THEN ? ELSE last_post_timestamp END, last_checked_at = ? WHERE id = ?").bind(latest ?? 0, latest, checkedAt, account.id));
+  } else if (page.cursor && latest !== null && latest > account.last_post_timestamp) {
+    next = { cursor: page.cursor, queuedCursor: null, since: account.last_post_timestamp, latest };
   } else {
     statements.push(db.prepare(`
       UPDATE accounts
       SET last_post_timestamp = CASE WHEN ? > COALESCE(last_post_timestamp, 0) THEN ? ELSE last_post_timestamp END,
           last_checked_at = ?
       WHERE id = ?
-    `).bind(latest, latest || null, checkedAt, account.id));
+    `).bind(latest ?? 0, latest, checkedAt, account.id));
+  }
+  if (next) {
+    statements.push(db.prepare("UPDATE accounts SET last_checked_at = ? WHERE id = ?").bind(checkedAt, account.id));
+    statements.push(stateStatement(db, stateKey, accountCheckpointValue(next), checkedAt));
+  } else {
     statements.push(db.prepare("DELETE FROM collector_state WHERE key = ?").bind(stateKey));
   }
   await db.batch(statements);
+  return next;
+}
+
+async function saveAccountBacklog(
+  db: D1Database,
+  account: DbAccount,
+  checkpoint: AccountStatusCheckpoint,
+  page: { statuses: ApiStatus[]; cursor: string | null },
+  checkedAt: string,
+): Promise<AccountStatusCheckpoint | null> {
+  const latest = latestTimestamp(account, checkpoint, page.statuses);
+  const statements: D1PreparedStatement[] = [];
+  const posts = postsStatement(db, page.statuses.filter((post) => !post.isReply), "following", account.handle, checkedAt);
+  if (posts) statements.push(posts);
+  const stateKey = accountStatusStateKey(account.id);
+  let next: AccountStatusCheckpoint | null;
+  if (page.cursor) {
+    next = {
+      ...checkpoint,
+      cursor: page.cursor,
+      queuedCursor: page.cursor === checkpoint.queuedCursor ? null : checkpoint.queuedCursor,
+      latest,
+    };
+  } else if (checkpoint.queuedCursor) {
+    next = { cursor: checkpoint.queuedCursor, queuedCursor: null, since: checkpoint.since, latest };
+  } else {
+    next = null;
+  }
+  if (next) {
+    statements.push(db.prepare("UPDATE accounts SET last_checked_at = ? WHERE id = ?").bind(checkedAt, account.id));
+    statements.push(stateStatement(db, stateKey, accountCheckpointValue(next), checkedAt));
+  } else {
+    statements.push(db.prepare(`
+      UPDATE accounts
+      SET last_post_timestamp = CASE WHEN ? > COALESCE(last_post_timestamp, 0) THEN ? ELSE last_post_timestamp END,
+          last_checked_at = ?
+      WHERE id = ?
+    `).bind(latest ?? 0, latest, checkedAt, account.id));
+    statements.push(db.prepare("DELETE FROM collector_state WHERE key = ?").bind(stateKey));
+  }
+  await db.batch(statements);
+  return next;
 }
 
 function searchCheckpointValue(query: DbQuery, checkpoint: SearchQueryCheckpoint): string {
@@ -386,7 +470,9 @@ function searchCheckpointValue(query: DbQuery, checkpoint: SearchQueryCheckpoint
     query: query.query,
     backlog_cursor: checkpoint.backlogCursor,
     stop_watermark: checkpoint.stopWatermark,
+    stop_ids: checkpoint.stopIds,
     pending_latest: checkpoint.pendingLatest,
+    pending_latest_ids: checkpoint.pendingLatestIds,
   });
 }
 
@@ -398,6 +484,20 @@ function newestStatusTimestamp(posts: ApiStatus[]): number | null {
 function oldestStatusTimestamp(posts: ApiStatus[]): number | null {
   const oldest = posts.reduce((min, post) => Math.min(min, post.createdTimestamp), Number.MAX_SAFE_INTEGER);
   return oldest === Number.MAX_SAFE_INTEGER ? null : oldest;
+}
+
+function statusIdsAtTimestamp(posts: ApiStatus[], timestamp: number | null): string[] {
+  if (timestamp === null) return [];
+  return [...new Set(posts.filter((post) => post.createdTimestamp === timestamp).map((post) => post.id))];
+}
+
+function mergeIds(left: string[], right: string[]): string[] {
+  return [...new Set([...left, ...right])];
+}
+
+function idsForTimestamp(timestamp: number | null, ...sources: Array<{ timestamp: number | null; ids: string[] }>): string[] {
+  if (timestamp === null) return [];
+  return sources.reduce<string[]>((ids, source) => source.timestamp === timestamp ? mergeIds(ids, source.ids) : ids, []);
 }
 
 async function saveSearchLatest(
@@ -412,16 +512,36 @@ async function saveSearchLatest(
     query: query.query,
     backlogCursor: null,
     stopWatermark: latest,
+    stopIds: statusIdsAtTimestamp(page.statuses, latest),
     pendingLatest: null,
+    pendingLatestIds: [],
   };
   if (checkpoint) {
     const pendingLatest = Math.max(checkpoint.pendingLatest ?? 0, latest ?? 0) || null;
+    const pendingLatestIds = latest !== null && latest === pendingLatest
+      ? (checkpoint.pendingLatest === pendingLatest ? mergeIds(checkpoint.pendingLatestIds, statusIdsAtTimestamp(page.statuses, latest)) : statusIdsAtTimestamp(page.statuses, latest))
+      : checkpoint.pendingLatestIds;
     if (checkpoint.backlogCursor) {
-      next = { ...checkpoint, pendingLatest };
-    } else if (latest !== null && checkpoint.stopWatermark !== null && latest > checkpoint.stopWatermark && page.cursor) {
-      next = { ...checkpoint, backlogCursor: page.cursor, pendingLatest };
+      next = { ...checkpoint, pendingLatest, pendingLatestIds };
+    } else if (
+      latest !== null && checkpoint.stopWatermark !== null &&
+      (latest > checkpoint.stopWatermark || (latest === checkpoint.stopWatermark && statusIdsAtTimestamp(page.statuses, latest).some((id) => !checkpoint.stopIds.includes(id)))) &&
+      page.cursor
+    ) {
+      next = { ...checkpoint, backlogCursor: page.cursor, pendingLatest, pendingLatestIds };
     } else {
-      next = { ...checkpoint, stopWatermark: Math.max(checkpoint.stopWatermark ?? 0, pendingLatest ?? 0) || null, pendingLatest: null };
+      const stopWatermark = Math.max(checkpoint.stopWatermark ?? 0, pendingLatest ?? 0) || null;
+      next = {
+        ...checkpoint,
+        stopWatermark,
+        stopIds: idsForTimestamp(stopWatermark,
+          { timestamp: checkpoint.stopWatermark, ids: checkpoint.stopIds },
+          { timestamp: checkpoint.pendingLatest, ids: pendingLatestIds },
+          { timestamp: latest, ids: statusIdsAtTimestamp(page.statuses, latest) },
+        ),
+        pendingLatest: null,
+        pendingLatestIds: [],
+      };
     }
   }
   const statements: D1PreparedStatement[] = [];
@@ -442,16 +562,28 @@ async function saveSearchBacklog(
 ): Promise<void> {
   const oldest = oldestStatusTimestamp(page.statuses);
   const latest = newestStatusTimestamp(page.statuses);
-  const reachedStop = checkpoint.stopWatermark !== null && oldest !== null && oldest <= checkpoint.stopWatermark;
+  const pageIdsAtStop = statusIdsAtTimestamp(page.statuses, checkpoint.stopWatermark);
+  const reachedStop = checkpoint.stopWatermark !== null && oldest !== null &&
+    (oldest < checkpoint.stopWatermark || (oldest === checkpoint.stopWatermark && pageIdsAtStop.some((id) => checkpoint.stopIds.includes(id))));
   const complete = page.cursor === null || reachedStop;
+  const pendingLatest = Math.max(checkpoint.pendingLatest ?? 0, latest ?? 0) || null;
+  const pendingLatestIds = latest !== null && latest === pendingLatest
+    ? (checkpoint.pendingLatest === pendingLatest ? mergeIds(checkpoint.pendingLatestIds, statusIdsAtTimestamp(page.statuses, latest)) : statusIdsAtTimestamp(page.statuses, latest))
+    : checkpoint.pendingLatestIds;
   const next: SearchQueryCheckpoint = complete
     ? {
         query: query.query,
         backlogCursor: null,
-        stopWatermark: Math.max(checkpoint.stopWatermark ?? 0, checkpoint.pendingLatest ?? 0, latest ?? 0) || null,
+        stopWatermark: Math.max(checkpoint.stopWatermark ?? 0, pendingLatest ?? 0) || null,
+        stopIds: idsForTimestamp(Math.max(checkpoint.stopWatermark ?? 0, pendingLatest ?? 0) || null,
+          { timestamp: checkpoint.stopWatermark, ids: checkpoint.stopIds },
+          { timestamp: checkpoint.pendingLatest, ids: checkpoint.pendingLatestIds },
+          { timestamp: pendingLatest, ids: pendingLatestIds },
+        ),
         pendingLatest: null,
+        pendingLatestIds: [],
       }
-    : { ...checkpoint, backlogCursor: page.cursor };
+    : { ...checkpoint, backlogCursor: page.cursor, pendingLatest, pendingLatestIds };
   const statements: D1PreparedStatement[] = [];
   const posts = postsStatement(db, page.statuses, "search", query.query, checkedAt);
   if (posts) statements.push(posts);
@@ -528,20 +660,40 @@ async function collectAccountStatuses(db: D1Database, nowMs: number): Promise<nu
     }
     try {
       const checkpoint = await readAccountStatusCheckpoint(db, account.id);
-      const query = new URLSearchParams();
-      query.set("count", String(STATUS_API_COUNT));
-      if (checkpoint?.cursor) query.set("cursor", checkpoint.cursor);
       const since = checkpoint ? checkpoint.since : account.last_post_timestamp;
-      if (since) query.set("since", String(since));
-      const queryString = query.toString();
-      const body = await fetchApi(
-        `${API_BASE}/2/profile/${encodeURIComponent(account.handle)}/statuses${queryString ? `?${queryString}` : ""}`,
-        `account:${account.handle}`,
-        { allowNoContent: !checkpoint?.cursor },
-      );
-      const page = normalizeStatusPage(body);
-      if (page.statuses.length > STATUS_API_COUNT) throw new Error(`account:${account.handle}: upstream returned more than ${STATUS_API_COUNT} statuses`);
-      await saveAccountPosts(db, account, checkpoint, page, since, checkedAt);
+      let nextCheckpoint = checkpoint;
+      let freshSucceeded = false;
+      try {
+        const freshQuery = new URLSearchParams({ count: String(STATUS_API_COUNT) });
+        if (since) freshQuery.set("since", String(since));
+        const freshBody = await fetchApi(
+          `${API_BASE}/2/profile/${encodeURIComponent(account.handle)}/statuses?${freshQuery}`,
+          `account:${account.handle}`,
+          { allowNoContent: true },
+        );
+        const freshPage = normalizeStatusPage(freshBody);
+        if (freshPage.statuses.length > STATUS_API_COUNT) throw new Error(`account:${account.handle}: upstream returned more than ${STATUS_API_COUNT} statuses`);
+        nextCheckpoint = await saveAccountFresh(db, account, checkpoint, freshPage, since, checkedAt);
+        freshSucceeded = true;
+      } catch (error) {
+        logSourceFailure(`account:${account.handle}:fresh`, error);
+      }
+      if (freshSucceeded && nextCheckpoint?.cursor) {
+        const backlogQuery = new URLSearchParams({ count: String(STATUS_API_COUNT), cursor: nextCheckpoint.cursor });
+        if (nextCheckpoint.since) backlogQuery.set("since", String(nextCheckpoint.since));
+        try {
+          const backlogBody = await fetchApi(
+            `${API_BASE}/2/profile/${encodeURIComponent(account.handle)}/statuses?${backlogQuery}`,
+            `account:${account.handle}:backlog`,
+            { allowNoContent: true },
+          );
+          const backlogPage = normalizeStatusPage(backlogBody);
+          if (backlogPage.statuses.length > STATUS_API_COUNT) throw new Error(`account:${account.handle}: upstream returned more than ${STATUS_API_COUNT} backlog statuses`);
+          await saveAccountBacklog(db, account, nextCheckpoint, backlogPage, checkedAt);
+        } catch (error) {
+          logSourceFailure(`account:${account.handle}:backlog`, error);
+        }
+      }
     } catch (error) {
       logSourceFailure(`account:${account.handle}`, error);
     }

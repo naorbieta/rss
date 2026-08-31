@@ -323,8 +323,8 @@ describe("FxEmbed collector", () => {
   });
 
   it("keeps the worst no-following run within 50 D1 queries", async () => {
-    for (let index = 0; index < 3; index += 1) {
-      await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind(`account-${index}`, `account-${index}`, `Account ${index}`).run();
+    for (let index = 0; index < 2; index += 1) {
+      await db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind(`account-${index}`, `account-${index}`, `Account ${index}`, 1_699_999_900).run();
     }
     for (let index = 1; index <= 6; index += 1) {
       await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind(`q${index}`).run();
@@ -342,7 +342,7 @@ describe("FxEmbed collector", () => {
       const parsed = new URL(String(input));
       if (parsed.pathname.endsWith("/statuses")) {
         expect(parsed.searchParams.get("count")).toBe("6");
-        return new Response(JSON.stringify({ results: { timeline: statusFixture(parsed.pathname.split("/").at(-2) ?? "account", 6) }, cursor: { bottom: null } }));
+        return new Response(JSON.stringify({ results: { timeline: statusFixture(parsed.pathname.split("/").at(-2) ?? "account", 6) }, cursor: { bottom: parsed.searchParams.has("cursor") ? null : "account-backlog" } }));
       }
       if (parsed.pathname === "/2/search") {
         expect(parsed.searchParams.get("count")).toBe("6");
@@ -353,10 +353,10 @@ describe("FxEmbed collector", () => {
     });
 
     const result = await collectOnce({ DB: counter.db, SOURCE_HANDLE: "source" }, 1_700_000_100_000);
-    expect(result).toEqual({ following: false, accounts: 3, queries: 3 });
-    expect(counter.queries.length).toBe(47);
+    expect(result).toEqual({ following: false, accounts: 2, queries: 3 });
+    expect(counter.queries.length).toBe(49);
     expect(counter.queries.length).toBeLessThanOrEqual(50);
-    expect(fetchMock).toHaveBeenCalledTimes(9);
+    expect(fetchMock).toHaveBeenCalledTimes(10);
   });
 
   it("keeps a following final page and three searches within 50 D1 queries", async () => {
@@ -448,15 +448,6 @@ describe("FxEmbed collector", () => {
         { id: "new", url: "https://x.com/alice/status/new", text: "新着", created_timestamp: 1_700_000_000, author: { id: "a", screen_name: "alice", name: "Alice" } },
       ] }, cursor: { bottom: "page-2" } }));
     });
-
-    await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
-    expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(1_699_999_900);
-    expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("account_status:a").first<{ value: string }>())?.value ?? "null")).toEqual({
-      cursor: "page-2",
-      since: 1_699_999_900,
-      latest: 1_700_000_000,
-    });
-
     fetchMock.mockImplementationOnce(async (input) => {
       const parsed = new URL(String(input));
       expect(parsed.pathname).toBe("/2/profile/alice/statuses");
@@ -464,13 +455,38 @@ describe("FxEmbed collector", () => {
       expect(parsed.searchParams.get("since")).toBe("1699999900");
       return new Response(JSON.stringify({ results: { timeline: [
         { id: "older", url: "https://x.com/alice/status/older", text: "過去", created_timestamp: 1_699_999_950, author: { id: "a", screen_name: "alice", name: "Alice" } },
+      ] }, cursor: { bottom: "page-3" } }));
+    });
+    fetchMock.mockImplementationOnce(async (input) => {
+      const parsed = new URL(String(input));
+      expect(parsed.pathname).toBe("/2/profile/alice/statuses");
+      expect(parsed.searchParams.get("cursor")).toBeNull();
+      expect(parsed.searchParams.get("since")).toBe("1699999900");
+      return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: "page-3" } }));
+    });
+    fetchMock.mockImplementationOnce(async (input) => {
+      const parsed = new URL(String(input));
+      expect(parsed.pathname).toBe("/2/profile/alice/statuses");
+      expect(parsed.searchParams.get("cursor")).toBe("page-3");
+      expect(parsed.searchParams.get("since")).toBe("1699999900");
+      return new Response(JSON.stringify({ results: { timeline: [
+        { id: "older-2", url: "https://x.com/alice/status/older-2", text: "過去2", created_timestamp: 1_699_999_900, author: { id: "a", screen_name: "alice", name: "Alice" } },
       ] }, cursor: { bottom: null } }));
+    });
+
+    await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
+    expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(1_699_999_900);
+    expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("account_status:a").first<{ value: string }>())?.value ?? "null")).toMatchObject({
+      cursor: "page-3",
+      queued_cursor: null,
+      since: 1_699_999_900,
+      latest: 1_700_000_000,
     });
 
     await collectOnce(accountRuntimeEnv, 1_700_000_101_000);
     expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(1_700_000_000);
     expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("account_status:a").first<{ count: number }>())?.count).toBe(0);
-    expect((await db.prepare("SELECT id FROM posts ORDER BY id").all<{ id: string }>()).results.map((post) => post.id)).toEqual(["new", "older"]);
+    expect((await db.prepare("SELECT id FROM posts ORDER BY id").all<{ id: string }>()).results.map((post) => post.id)).toEqual(["new", "older", "older-2"]);
   });
 
   it("keeps an account status cursor unchanged when its next page fails", async () => {
@@ -481,13 +497,111 @@ describe("FxEmbed collector", () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [
         { id: "new", url: "https://x.com/alice/status/new", text: "新着", created_timestamp: 1_700_000_000, author: { id: "a", screen_name: "alice", name: "Alice" } },
       ] }, cursor: { bottom: "page-2" } })))
+      .mockResolvedValueOnce(new Response("upstream failed", { status: 500 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: "page-2" } })))
       .mockResolvedValueOnce(new Response("upstream failed", { status: 500 }));
 
     await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
     await collectOnce(accountRuntimeEnv, 1_700_000_101_000);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
     expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(1_699_999_900);
     expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("account_status:a").first<{ value: string }>())?.value ?? "null")).toMatchObject({ cursor: "page-2" });
+  });
+
+  it("checks account fresh first and switches a queued cursor only after backlog ends", async () => {
+    await db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("a", "alice", "Alice", 1_699_999_900).run();
+    await markFollowingAsCurrent();
+    const status = (id: string, timestamp: number) => ({ id, url: `https://x.com/alice/status/${id}`, text: id, created_timestamp: timestamp, author: { id: "a", screen_name: "alice", name: "Alice" } });
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [status("fresh-1", 1_700_000_000)] }, cursor: { bottom: "cursor-1" } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [status("older-1", 1_699_999_950)] }, cursor: { bottom: "cursor-2" } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [status("fresh-2", 1_700_000_001)] }, cursor: { bottom: "queued-cursor" } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: "queued-cursor" } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [status("older-2", 1_699_999_900)] }, cursor: { bottom: null } })));
+
+    await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
+    expect(new URL(String(fetchMock.mock.calls[0][0])).searchParams.get("cursor")).toBeNull();
+    expect(new URL(String(fetchMock.mock.calls[1][0])).searchParams.get("cursor")).toBe("cursor-1");
+    expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("account_status:a").first<{ value: string }>())?.value ?? "null")).toMatchObject({ cursor: "cursor-2", queued_cursor: null });
+
+    await collectOnce(accountRuntimeEnv, 1_700_000_101_000);
+    expect(new URL(String(fetchMock.mock.calls[2][0])).searchParams.get("cursor")).toBeNull();
+    expect(new URL(String(fetchMock.mock.calls[3][0])).searchParams.get("cursor")).toBe("cursor-2");
+    expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("account_status:a").first<{ value: string }>())?.value ?? "null")).toMatchObject({ cursor: "queued-cursor", queued_cursor: null });
+    expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(1_699_999_900);
+
+    await collectOnce(accountRuntimeEnv, 1_700_000_102_000);
+    expect(new URL(String(fetchMock.mock.calls[4][0])).searchParams.get("cursor")).toBeNull();
+    expect(new URL(String(fetchMock.mock.calls[5][0])).searchParams.get("cursor")).toBe("queued-cursor");
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("account_status:a").first<{ count: number }>())?.count).toBe(0);
+    expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(1_700_000_001);
+  });
+
+  it("preserves an existing queued cursor when fresh repeats the current cursor", async () => {
+    const checkedAt = "2023-11-14T22:00:00.000Z";
+    await db.batch([
+      db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("a", "alice", "Alice", 1_699_999_900),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("account_status:a", JSON.stringify({ cursor: "current", queued_cursor: "queued", since: 1_699_999_900, latest: 1_700_000_000 }), checkedAt),
+    ]);
+    await markFollowingAsCurrent();
+    let freshRuns = 0;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const cursor = new URL(String(input)).searchParams.get("cursor");
+      if (cursor === null) {
+        freshRuns += 1;
+        const freshCursor = freshRuns === 1 ? "current" : "queued";
+        return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: freshCursor } }));
+      }
+      if (cursor === "current") return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: "queued" } }));
+      if (cursor === "queued") return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } }));
+      throw new Error(`unexpected cursor: ${cursor}`);
+    });
+
+    await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
+    expect(new URL(String(fetchMock.mock.calls[0][0])).searchParams.get("cursor")).toBeNull();
+    expect(new URL(String(fetchMock.mock.calls[1][0])).searchParams.get("cursor")).toBe("current");
+    expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("account_status:a").first<{ value: string }>())?.value ?? "null")).toMatchObject({ cursor: "queued", queued_cursor: null });
+
+    await collectOnce(accountRuntimeEnv, 1_700_000_101_000);
+    expect(new URL(String(fetchMock.mock.calls[2][0])).searchParams.get("cursor")).toBeNull();
+    expect(new URL(String(fetchMock.mock.calls[3][0])).searchParams.get("cursor")).toBe("queued");
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("account_status:a").first<{ count: number }>())?.count).toBe(0);
+  });
+
+  it("does not start account history pagination when the initial timestamp is empty", async () => {
+    await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind("a", "alice", "Alice").run();
+    await markFollowingAsCurrent();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ results: { timeline: [
+      { id: "initial", url: "https://x.com/alice/status/initial", text: "初回", created_timestamp: 1_700_000_000, author: { id: "a", screen_name: "alice", name: "Alice" } },
+    ] }, cursor: { bottom: "history" } })));
+
+    await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(1_700_000_000);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("account_status:a").first<{ count: number }>())?.count).toBe(0);
+  });
+
+  it("keeps an account backlog cursor when its fresh page fails", async () => {
+    const checkedAt = "2023-11-14T22:00:00.000Z";
+    await db.batch([
+      db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("a", "alice", "Alice", 1_699_999_900),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("account_status:a", JSON.stringify({ cursor: "page-2", since: 1_699_999_900, latest: 1_700_000_000 }), checkedAt),
+    ]);
+    await markFollowingAsCurrent();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("fresh failed", { status: 500 }));
+
+    await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("account_status:a").first<{ value: string }>())?.value).toContain("page-2");
+
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: "page-2" } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } })));
+    await collectOnce(accountRuntimeEnv, 1_700_000_101_000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("account_status:a").first<{ count: number }>())?.count).toBe(0);
   });
 
   it("continues an in-progress following sync and waits 24 hours after completion", async () => {
@@ -688,10 +802,15 @@ describe("FxEmbed collector", () => {
     });
 
     await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
-    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_scan_position").first<{ value: string }>())?.value).toBe("3");
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_scan_position").first<{ value: string }>())?.value).toBe("2");
     fetchMock.mockClear();
     await collectOnce(accountRuntimeEnv, 1_700_000_101_000);
-    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toContain("/2/profile/h03/statuses");
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
+      "/2/profile/h02/statuses",
+      "/2/profile/h03/statuses",
+    ]);
+    fetchMock.mockClear();
+    await collectOnce(accountRuntimeEnv, 1_700_000_102_000);
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toContain("/2/profile/h00/statuses");
   });
 
@@ -724,7 +843,9 @@ describe("FxEmbed collector", () => {
       query: "empty-then-new",
       backlog_cursor: null,
       stop_watermark: 1_700_000_000,
+      stop_ids: ["new-latest-0"],
       pending_latest: null,
+      pending_latest_ids: [],
     });
   });
 
@@ -786,7 +907,9 @@ describe("FxEmbed collector", () => {
       query: "cursor-query",
       backlog_cursor: "search-page-3",
       stop_watermark: 1_699_999_900,
+      stop_ids: [],
       pending_latest: 1_700_000_001,
+      pending_latest_ids: ["latest-1"],
     });
 
     fetchMock.mockImplementationOnce(async (input) => {
@@ -815,7 +938,9 @@ describe("FxEmbed collector", () => {
       query: "cursor-query",
       backlog_cursor: null,
       stop_watermark: 1_700_000_002,
+      stop_ids: ["latest-2"],
       pending_latest: null,
+      pending_latest_ids: [],
     });
     expect((await db.prepare("SELECT id FROM posts ORDER BY id").all<{ id: string }>()).results.map((post) => post.id)).toEqual(["latest-1", "latest-2", "search-1", "search-2", "search-boundary"]);
 
@@ -861,6 +986,37 @@ describe("FxEmbed collector", () => {
     await collectOnce(runtimeEnv, 1_700_000_101_000);
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect((await db.prepare("SELECT id FROM posts ORDER BY id").all<{ id: string }>()).results.map((post) => post.id)).toEqual(["initial", "newest", "older"]);
+  });
+
+  it("tracks same-second search IDs so a new post starts backlog once", async () => {
+    await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("same-second").run();
+    const sameSecond = (id: string) => ({
+      id,
+      url: `https://x.com/a/status/${id}`,
+      text: id,
+      created_timestamp: 1_700_000_000,
+      author: { id: "a", screen_name: "alice", name: "Alice" },
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: ["s1", "s2", "s3", "s4", "s5", "s6"].map(sameSecond) }, cursor: { bottom: "initial-history" } })));
+    await collectOnce(runtimeEnv, 1_700_000_100_000);
+
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: ["s1", "s2", "s3", "s4", "s5", "new-7"].map(sameSecond) }, cursor: { bottom: "same-second-history" } })));
+    fetchMock.mockImplementationOnce(async (input) => {
+      expect(new URL(String(input)).searchParams.get("cursor")).toBe("same-second-history");
+      return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } }));
+    });
+    await collectOnce(runtimeEnv, 1_700_000_101_000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(7);
+
+    fetchMock.mockImplementationOnce(async (input) => {
+      expect(new URL(String(input)).searchParams.get("cursor")).toBeNull();
+      return new Response(JSON.stringify({ results: { timeline: ["s1", "s2", "s3", "s4", "s5", "s6"].map(sameSecond) }, cursor: { bottom: "should-not-start" } }));
+    });
+    await collectOnce(runtimeEnv, 1_700_000_102_000);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(7);
   });
 
   it("keeps a search cursor when its next page fails", async () => {
