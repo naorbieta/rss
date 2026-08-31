@@ -606,15 +606,32 @@ export async function syncFollowingPage(db: D1Database, sourceHandle: string, no
   const page = normalizeFollowingPage(body);
   if (page.accounts.length > FOLLOWING_API_COUNT) throw new Error(`following: upstream returned more than ${FOLLOWING_API_COUNT} accounts`);
   const accountValues: Array<string | number> = [];
+  const accountIdentityValues: string[] = [];
   const accountRows = page.accounts.map((account) => {
+    accountIdentityValues.push(account.id, account.handle);
     accountValues.push(account.id, account.handle, account.name, account.protected ? 1 : 0, marker);
     return "(?, ?, ?, ?, ?)";
   }).join(", ");
-  if (accountRows) await db.batch([db.prepare(`
-    INSERT INTO accounts (id, handle, name, protected, sync_marker) VALUES ${accountRows}
-    ON CONFLICT(id) DO UPDATE SET handle = excluded.handle, name = excluded.name,
-      protected = excluded.protected, sync_marker = excluded.sync_marker
-  `).bind(...accountValues)]);
+  if (accountRows) {
+    const accountIdentityRows = page.accounts.map(() => "(?, ?)").join(", ");
+    await db.batch([
+      db.prepare(`
+        WITH incoming(id, handle) AS (VALUES ${accountIdentityRows})
+        DELETE FROM collector_state
+        WHERE key IN (
+          SELECT 'account_status:' || incoming.id
+          FROM incoming
+          JOIN accounts AS existing ON existing.id = incoming.id
+          WHERE existing.handle <> incoming.handle
+        )
+      `).bind(...accountIdentityValues),
+      db.prepare(`
+        INSERT INTO accounts (id, handle, name, protected, sync_marker) VALUES ${accountRows}
+        ON CONFLICT(id) DO UPDATE SET handle = excluded.handle, name = excluded.name,
+          protected = excluded.protected, sync_marker = excluded.sync_marker
+      `).bind(...accountValues),
+    ]);
+  }
 
   const stateStatements: D1PreparedStatement[] = [];
   if (page.cursor) {

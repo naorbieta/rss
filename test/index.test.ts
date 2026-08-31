@@ -397,7 +397,7 @@ describe("FxEmbed collector", () => {
 
     const result = await collectOnce({ DB: counter.db, SOURCE_HANDLE: "source" }, start);
     expect(result).toEqual({ following: true, accounts: 0, queries: 3 });
-    expect(counter.queries.length).toBe(42);
+    expect(counter.queries.length).toBe(43);
     expect(counter.queries.length).toBeLessThanOrEqual(50);
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
       "/2/profile/source/following",
@@ -715,6 +715,31 @@ describe("FxEmbed collector", () => {
 
     await syncFollowingPage(db, "source", 1_700_000_100_000);
     expect((await db.prepare("SELECT id, handle, name FROM accounts").all<{ id: string; handle: string; name: string }>()).results).toEqual([{ id: "a", handle: "newname", name: "New" }]);
+  });
+
+  it("clears a stale account status cursor when a following handle changes", async () => {
+    const previous = "2023-11-14T22:00:00.000Z";
+    await db.batch([
+      db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("a", "oldname", "Old", 1_699_999_900),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("account_status:a", JSON.stringify({ cursor: "stale-status", since: 1_699_999_900, latest: 1_700_000_000 }), previous),
+    ]);
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(async (input) => {
+        expect(new URL(String(input)).pathname).toBe("/2/profile/source/following");
+        return new Response(JSON.stringify({ results: { users: [{ id: "a", screen_name: "newname", name: "New" }] }, cursor: { bottom: null } }));
+      })
+      .mockImplementationOnce(async (input) => {
+        const parsed = new URL(String(input));
+        expect(parsed.pathname).toBe("/2/profile/newname/statuses");
+        expect(parsed.searchParams.get("cursor")).toBeNull();
+        expect(parsed.searchParams.get("since")).toBe("1699999900");
+        return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } }));
+      });
+
+    await syncFollowingPage(db, "source", 1_700_000_100_000);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("account_status:a").first<{ count: number }>())?.count).toBe(0);
+    await collectOnce({ DB: db, SOURCE_HANDLE: "source" }, 1_700_000_101_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("restarts following pagination when SOURCE_HANDLE changes", async () => {
