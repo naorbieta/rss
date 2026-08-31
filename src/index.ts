@@ -73,9 +73,12 @@ const MAX_ACCOUNTS_PER_RUN = 20;
 const MAX_QUERIES_PER_RUN = 5;
 const MAX_FOLLOWING_UPSERTS_PER_BATCH = 50;
 const FOLLOWING_RESYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
+// 26 upstream requests × 10 seconds fits within this lease; it remains below the 15-minute Cron interval.
+const COLLECTION_LEASE_MS = 10 * 60 * 1000;
 const ACCOUNT_STATUS_STATE_PREFIX = "account_status:";
 const SEARCH_QUERY_STATE_PREFIX = "search_query:";
 const FOLLOWING_PENDING_SOURCE_KEY = "following_pending_source_handle";
+const COLLECTION_LEASE_KEY = "collection_lease";
 
 function isRecord(value: unknown): value is JsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -513,34 +516,60 @@ async function canCollectAccountStatuses(db: D1Database, sourceHandle: string): 
   return Boolean(await readState(db, "following_sync_at"));
 }
 
+async function claimCollectionLease(db: D1Database, nowMs: number): Promise<string | null> {
+  const token = crypto.randomUUID();
+  const value = `${nowMs + COLLECTION_LEASE_MS}:${token}`;
+  const result = await db.prepare(`
+    INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    WHERE CAST(substr(collector_state.value, 1, instr(collector_state.value, ':') - 1) AS INTEGER) <= ?
+  `).bind(COLLECTION_LEASE_KEY, value, new Date(nowMs).toISOString(), nowMs).run();
+  return result.meta.changes > 0 ? value : null;
+}
+
+async function releaseCollectionLease(db: D1Database, value: string): Promise<void> {
+  await db.prepare("DELETE FROM collector_state WHERE key = ? AND value = ?").bind(COLLECTION_LEASE_KEY, value).run();
+}
+
 export async function collectOnce(env: RuntimeEnv, nowMs = Date.now()): Promise<{ following: boolean; accounts: number; queries: number }> {
-  const sourceHandle = env.SOURCE_HANDLE.trim();
-  let following = false;
-  if (sourceHandle && await shouldSyncFollowing(env.DB, sourceHandle, nowMs)) {
-    try {
-      await syncFollowingPage(env.DB, sourceHandle, nowMs);
-      following = true;
-    } catch (error) {
-      logSourceFailure("following", error);
-    }
-  }
+  const leaseValue = await claimCollectionLease(env.DB, nowMs);
+  if (!leaseValue) return { following: false, accounts: 0, queries: 0 };
 
-  let accounts = 0;
-  if (sourceHandle && await canCollectAccountStatuses(env.DB, sourceHandle)) {
-    try {
-      accounts = await collectAccountStatuses(env.DB, nowMs);
-    } catch (error) {
-      logSourceFailure("accounts", error);
-    }
-  }
-
-  let queries = 0;
   try {
-    queries = await collectSearchQueries(env.DB, nowMs);
-  } catch (error) {
-    logSourceFailure("queries", error);
+    const sourceHandle = env.SOURCE_HANDLE.trim();
+    let following = false;
+    if (sourceHandle && await shouldSyncFollowing(env.DB, sourceHandle, nowMs)) {
+      try {
+        await syncFollowingPage(env.DB, sourceHandle, nowMs);
+        following = true;
+      } catch (error) {
+        logSourceFailure("following", error);
+      }
+    }
+
+    let accounts = 0;
+    if (sourceHandle && await canCollectAccountStatuses(env.DB, sourceHandle)) {
+      try {
+        accounts = await collectAccountStatuses(env.DB, nowMs);
+      } catch (error) {
+        logSourceFailure("accounts", error);
+      }
+    }
+
+    let queries = 0;
+    try {
+      queries = await collectSearchQueries(env.DB, nowMs);
+    } catch (error) {
+      logSourceFailure("queries", error);
+    }
+    return { following, accounts, queries };
+  } finally {
+    try {
+      await releaseCollectionLease(env.DB, leaseValue);
+    } catch (error) {
+      logSourceFailure("collection_lease", error);
+    }
   }
-  return { following, accounts, queries };
 }
 
 function json(value: unknown, status = 200): Response {

@@ -438,6 +438,65 @@ describe("FxEmbed collector", () => {
     expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE query = ?").bind("still-searches").first<{ last_checked_at: string }>())?.last_checked_at).toBe("2023-11-14T22:15:00.000Z");
   });
 
+  it("serializes overlapping collection runs and releases the lease after completion", async () => {
+    let releaseFollowing!: () => void;
+    let markFollowingStarted!: () => void;
+    const followingGate = new Promise<void>((resolve) => { releaseFollowing = resolve; });
+    const followingStarted = new Promise<void>((resolve) => { markFollowingStarted = resolve; });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const parsed = new URL(String(input));
+      if (parsed.pathname === "/2/profile/source/following") {
+        markFollowingStarted();
+        await followingGate;
+        return new Response(JSON.stringify({ results: { users: [{ id: "a", screen_name: "alice", name: "Alice" }] }, cursor: { bottom: null } }));
+      }
+      if (parsed.pathname === "/2/profile/alice/statuses") {
+        return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } }));
+      }
+      return new Response(JSON.stringify({ code: 404, results: [] }), { status: 404 });
+    });
+
+    const start = 1_700_000_100_000;
+    const firstRun = collectOnce(accountRuntimeEnv, start);
+    await followingStarted;
+    expect(await collectOnce(accountRuntimeEnv, start)).toEqual({ following: false, accounts: 0, queries: 0 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    releaseFollowing();
+    expect(await firstRun).toEqual({ following: true, accounts: 1, queries: 0 });
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM accounts").first<{ count: number }>())?.count).toBe(1);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("collection_lease").first<{ count: number }>())?.count).toBe(0);
+
+    expect((await collectOnce(accountRuntimeEnv, start + 25 * 60 * 60 * 1000)).following).toBe(true);
+    expect(fetchMock.mock.calls.filter(([input]) => new URL(String(input)).pathname === "/2/profile/source/following")).toHaveLength(2);
+  });
+
+  it("releases the collection lease when following fails so a later run can retry", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: "failed" }), { status: 500 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { users: [] }, cursor: { bottom: null } })));
+    const start = 1_700_000_100_000;
+
+    expect(await collectOnce(accountRuntimeEnv, start)).toEqual({ following: false, accounts: 0, queries: 0 });
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("collection_lease").first<{ count: number }>())?.count).toBe(0);
+    expect((await collectOnce(accountRuntimeEnv, start + 1_000)).following).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers an expired collection lease and releases it after the run", async () => {
+    const start = 1_700_000_100_000;
+    await db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind(
+      "collection_lease",
+      `${start - 1}:expired-token`,
+      new Date(start - 1).toISOString(),
+    ).run();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ results: { users: [] }, cursor: { bottom: null } })));
+
+    expect(await collectOnce(accountRuntimeEnv, start)).toEqual({ following: true, accounts: 0, queries: 0 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("collection_lease").first<{ count: number }>())?.count).toBe(0);
+  });
+
   it("runs collection from the scheduled handler", async () => {
     await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("scheduled").run();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ code: 200, results: { timeline: [] }, cursor: { bottom: null } })));
