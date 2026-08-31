@@ -1,6 +1,6 @@
 # X 投稿フィード Worker
 
-これはローカル完結の MVP です。対象は following と検索語です。FxEmbed API v2 の結果を Cloudflare D1 に保存し、ChatGPT から読める JSON を返す最小構成の Worker です。初回は「セットアップ」「収集」「feed」の順に読み、障害時の動きと用語集は必要なときに参照してください。
+これはローカル完結の MVP です。まずローカルで試します。対象は following と検索語です。FxEmbed API v2 の結果を Cloudflare D1 に保存します。ChatGPT から読める JSON を返す最小構成の Worker です。初回は「セットアップ」「収集」「feed」の順に読み、障害時の動きと用語集は必要なときに参照してください。
 
 ## セットアップ
 
@@ -28,7 +28,7 @@ Wrangler の設定値を変更したら `npm run types` をもう一度実行し
 npx wrangler d1 execute rss-curator --local --command "INSERT INTO search_queries (query) VALUES ('cloudflare')"
 ```
 
-無効化・再有効化は `enabled` を `0`・`1` に更新します。Cron 1 回につき、`last_checked_at` が古い順に最大 5 件を処理します。
+無効化・再有効化は `enabled` を `0`・`1` に更新します。Cron 1 回につき、保存済みの巡回位置から最大 5 件を処理します。巡回位置は成功・失敗にかかわらず進み、`last_checked_at` は成功した検索語の checkpoint として保存されます。
 
 ## 収集を動かす
 
@@ -39,7 +39,7 @@ npx wrangler dev --test-scheduled
 curl "http://localhost:8787/__scheduled?cron=*/15+*+*+*+*"
 ```
 
-1 回の実行には上限があります。following は 1 ページ、アカウントは最大 20 件、検索語は最大 5 件です。following の cursor と full sync marker、巡回位置、最終同期時刻は `collector_state` に保存します。full sync 完了後は24時間待ち、途中の同期だけ毎回1ページ進めます。protected アカウントは保存しますが、status は取得しません。
+1 回の実行には上限があります。following は 1 ページ、アカウントは最大 20 件、検索語は最大 5 件です。following の source handle、cursor、full sync marker、巡回位置、最終同期時刻は `collector_state` に保存します。`SOURCE_HANDLE` を変更した場合は、古い cursor と marker を使わず新しい full sync を開始します。full sync 完了後は24時間待ち、途中の同期だけ毎回1ページ進めます。アカウントの status 取得も1アカウント1ページとし、ページ途中の cursor、固定した `since`、取得済みページの最新時刻を `collector_state` に保存して次回へ続けます。protected アカウントは保存しますが、status は取得しません。
 
 ## feed を読む
 
@@ -83,14 +83,14 @@ curl "http://localhost:8787/feed?page=1&limit=100&hours=24"
 
 ## 障害時の動き
 
-外部 API の timeout・HTTP エラー・形式不正は source 単位で構造化ログに記録します。ほかのアカウントと検索語の処理は続けます。status の 204 は「新着なし」として成功扱いにし、アカウントの `last_checked_at` だけを更新します。失敗したアカウントの `last_checked_at` と `last_post_timestamp` は進めません。ただし、選択した batch の巡回位置は進め、次の巡回で再試行します。検索結果の「404 + code:404 + 空の results」は新着なしとして checkpoint を更新します。following full sync は全ページが成功した最後のページでだけ、前回同期にしか存在しないアカウントを削除します。
+外部 API の timeout・HTTP エラー・形式不正は source 単位で構造化ログに記録します。ほかのアカウントと検索語の処理は続けます。status の 204 は「新着なし」として成功扱いにし、アカウントの `last_checked_at` だけを更新します。status のページ途中で失敗した場合は、保存済みの cursor と固定した `since` を変えずに同じページを次回再試行します。`last_post_timestamp` は最後のページまで成功したときだけ進みます。失敗したアカウントの時刻は進めませんが、選択した batch の巡回位置は進め、次の巡回で再試行します。検索結果の「404 + code:404 + 空の results」は新着なしとして checkpoint を更新します。検索語の巡回位置も成功・失敗にかかわらず進むため、失敗した検索語が後続の検索語を占有しません。following full sync は全ページが成功した最後のページでだけ、前回同期にしか存在しないアカウントを削除します。
 
 投稿は X 投稿 ID を主キーに `INSERT OR IGNORE` で保存します。同じ Cron が重複実行されても、投稿と checkpoint は重複しません。投稿保存と各 source の checkpoint は同じ D1 batch で更新します。following のアカウント upsert は複数の小さな batch に分けます。全件成功後にだけ cursor と削除処理を更新します。
 
 ## 用語
 
 - **following**: `SOURCE_HANDLE` がフォローしているアカウント一覧。
-- **cursor**: following の次ページを指す上流 API の位置情報。
+- **cursor**: following またはアカウントの status の次ページを指す上流 API の位置情報。
 - **full sync marker**: 同期中に今回のページで確認したアカウントを識別する印。最後のページで古いアカウントを判定します。
 - **quote**: 投稿が引用している投稿の JSON object。推薦判断の材料としてそのまま保存します。
 - **D1**: この Worker が投稿、アカウント、検索語、収集位置を保存する SQLite 互換データベース。

@@ -30,6 +30,12 @@ type DbAccount = {
   last_checked_at: string | null;
 };
 
+type AccountStatusCheckpoint = {
+  cursor: string;
+  since: number | null;
+  latest: number | null;
+};
+
 type DbQuery = {
   id: number;
   query: string;
@@ -62,6 +68,7 @@ const MAX_ACCOUNTS_PER_RUN = 20;
 const MAX_QUERIES_PER_RUN = 5;
 const MAX_FOLLOWING_UPSERTS_PER_BATCH = 50;
 const FOLLOWING_RESYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const ACCOUNT_STATUS_STATE_PREFIX = "account_status:";
 
 function isRecord(value: unknown): value is JsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -231,6 +238,30 @@ async function readState(db: D1Database, key: string): Promise<string | null> {
   return row?.value ?? null;
 }
 
+function accountStatusStateKey(accountId: string): string {
+  return `${ACCOUNT_STATUS_STATE_PREFIX}${accountId}`;
+}
+
+async function readAccountStatusCheckpoint(db: D1Database, accountId: string): Promise<AccountStatusCheckpoint | null> {
+  const value = await readState(db, accountStatusStateKey(accountId));
+  if (!value) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!isRecord(parsed)) return null;
+    const cursor = asString(parsed.cursor);
+    if (!cursor) return null;
+    const sinceValue = parsed.since;
+    const latestValue = parsed.latest;
+    return {
+      cursor,
+      since: sinceValue === null ? null : asTimestamp(sinceValue),
+      latest: latestValue === null ? null : asTimestamp(latestValue),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function postStatement(db: D1Database, post: ApiStatus, sourceKind: "following" | "search", sourceKey: string, collectedAt: string): D1PreparedStatement {
   return db.prepare(`
     INSERT OR IGNORE INTO posts
@@ -256,13 +287,31 @@ function postStatement(db: D1Database, post: ApiStatus, sourceKind: "following" 
   );
 }
 
-async function saveAccountPosts(db: D1Database, account: DbAccount, posts: ApiStatus[], checkedAt: string): Promise<void> {
-  const latest = posts.reduce((max, post) => Math.max(max, post.createdTimestamp), account.last_post_timestamp ?? 0);
-  const statements = posts.filter((post) => !post.isReply).map((post) => postStatement(db, post, "following", account.handle, checkedAt));
-  if (latest > (account.last_post_timestamp ?? 0)) {
-    statements.push(db.prepare("UPDATE accounts SET last_post_timestamp = ?, last_checked_at = ? WHERE id = ?").bind(latest, checkedAt, account.id));
-  } else {
+async function saveAccountPosts(
+  db: D1Database,
+  account: DbAccount,
+  checkpoint: AccountStatusCheckpoint | null,
+  page: { statuses: ApiStatus[]; cursor: string | null },
+  since: number | null,
+  checkedAt: string,
+): Promise<void> {
+  const latest = page.statuses.reduce(
+    (max, post) => Math.max(max, post.createdTimestamp),
+    Math.max(account.last_post_timestamp ?? 0, checkpoint?.latest ?? 0),
+  );
+  const statements = page.statuses.filter((post) => !post.isReply).map((post) => postStatement(db, post, "following", account.handle, checkedAt));
+  const stateKey = accountStatusStateKey(account.id);
+  if (page.cursor) {
     statements.push(db.prepare("UPDATE accounts SET last_checked_at = ? WHERE id = ?").bind(checkedAt, account.id));
+    statements.push(stateStatement(db, stateKey, JSON.stringify({ cursor: page.cursor, since, latest: latest || null }), checkedAt));
+  } else {
+    statements.push(db.prepare(`
+      UPDATE accounts
+      SET last_post_timestamp = CASE WHEN ? > COALESCE(last_post_timestamp, 0) THEN ? ELSE last_post_timestamp END,
+          last_checked_at = ?
+      WHERE id = ?
+    `).bind(latest, latest || null, checkedAt, account.id));
+    statements.push(db.prepare("DELETE FROM collector_state WHERE key = ?").bind(stateKey));
   }
   await db.batch(statements);
 }
@@ -274,8 +323,10 @@ async function saveQueryPosts(db: D1Database, query: DbQuery, posts: ApiStatus[]
 }
 
 export async function syncFollowingPage(db: D1Database, sourceHandle: string, nowMs = Date.now()): Promise<{ complete: boolean; count: number }> {
-  const currentCursor = await readState(db, "following_cursor");
-  const marker = await readState(db, "following_marker") || crypto.randomUUID();
+  const savedSourceHandle = await readState(db, "following_source_handle");
+  const sameSource = savedSourceHandle === sourceHandle;
+  const currentCursor = sameSource ? await readState(db, "following_cursor") : null;
+  const marker = (sameSource ? await readState(db, "following_marker") : null) || crypto.randomUUID();
   const query = new URLSearchParams({ count: "100" });
   if (currentCursor) query.set("cursor", currentCursor);
   const body = await fetchApi(`${API_BASE}/2/profile/${encodeURIComponent(sourceHandle)}/following?${query}`, "following");
@@ -293,10 +344,17 @@ export async function syncFollowingPage(db: D1Database, sourceHandle: string, no
 
   const stateStatements: D1PreparedStatement[] = [];
   if (page.cursor) {
+    stateStatements.push(stateStatement(db, "following_source_handle", sourceHandle, updatedAt));
     stateStatements.push(stateStatement(db, "following_cursor", page.cursor, updatedAt));
     stateStatements.push(stateStatement(db, "following_marker", marker, updatedAt));
   } else {
     stateStatements.push(db.prepare("DELETE FROM accounts WHERE sync_marker IS NULL OR sync_marker <> ?").bind(marker));
+    stateStatements.push(db.prepare(`
+      DELETE FROM collector_state
+      WHERE key LIKE ?
+        AND substr(key, ?) NOT IN (SELECT id FROM accounts WHERE sync_marker = ?)
+    `).bind(`${ACCOUNT_STATUS_STATE_PREFIX}%`, ACCOUNT_STATUS_STATE_PREFIX.length + 1, marker));
+    stateStatements.push(stateStatement(db, "following_source_handle", sourceHandle, updatedAt));
     stateStatements.push(stateStatement(db, "following_cursor", "", updatedAt));
     stateStatements.push(stateStatement(db, "following_marker", "", updatedAt));
     stateStatements.push(stateStatement(db, "following_sync_at", updatedAt, updatedAt));
@@ -328,12 +386,19 @@ async function collectAccountStatuses(db: D1Database, nowMs: number): Promise<nu
       continue;
     }
     try {
+      const checkpoint = await readAccountStatusCheckpoint(db, account.id);
       const query = new URLSearchParams();
-      if (account.last_post_timestamp) query.set("since", String(account.last_post_timestamp));
+      if (checkpoint?.cursor) query.set("cursor", checkpoint.cursor);
+      const since = checkpoint ? checkpoint.since : account.last_post_timestamp;
+      if (since) query.set("since", String(since));
       const queryString = query.toString();
-      const body = await fetchApi(`${API_BASE}/2/profile/${encodeURIComponent(account.handle)}/statuses${queryString ? `?${queryString}` : ""}`, `account:${account.handle}`, { allowNoContent: true });
+      const body = await fetchApi(
+        `${API_BASE}/2/profile/${encodeURIComponent(account.handle)}/statuses${queryString ? `?${queryString}` : ""}`,
+        `account:${account.handle}`,
+        { allowNoContent: !checkpoint?.cursor },
+      );
       const page = normalizeStatusPage(body);
-      await saveAccountPosts(db, account, page.statuses, checkedAt);
+      await saveAccountPosts(db, account, checkpoint, page, since, checkedAt);
     } catch (error) {
       logSourceFailure(`account:${account.handle}`, error);
     }
@@ -345,14 +410,31 @@ async function collectAccountStatuses(db: D1Database, nowMs: number): Promise<nu
 }
 
 async function collectSearchQueries(db: D1Database, nowMs: number): Promise<number> {
-  const rows = await db.prepare(`
+  const countRow = await db.prepare("SELECT COUNT(*) AS count FROM search_queries WHERE enabled = 1").first<{ count: number }>();
+  const total = countRow?.count ?? 0;
+  if (!total) return 0;
+  const savedPosition = Number(await readState(db, "search_scan_position") ?? 0);
+  const start = Number.isSafeInteger(savedPosition) && savedPosition >= 0 ? savedPosition % total : 0;
+  const firstLimit = Math.min(MAX_QUERIES_PER_RUN, total - start);
+  const firstRows = await db.prepare(`
     SELECT id, query, last_checked_at FROM search_queries
     WHERE enabled = 1
-    ORDER BY last_checked_at IS NOT NULL, last_checked_at, id
-    LIMIT ?
-  `).bind(MAX_QUERIES_PER_RUN).all<DbQuery>();
+    ORDER BY id
+    LIMIT ? OFFSET ?
+  `).bind(firstLimit, start).all<DbQuery>();
+  const selected = [...firstRows.results];
+  if (selected.length < Math.min(MAX_QUERIES_PER_RUN, total)) {
+    const remaining = Math.min(MAX_QUERIES_PER_RUN, total) - selected.length;
+    const wrappedRows = await db.prepare(`
+      SELECT id, query, last_checked_at FROM search_queries
+      WHERE enabled = 1
+      ORDER BY id
+      LIMIT ? OFFSET 0
+    `).bind(remaining).all<DbQuery>();
+    selected.push(...wrappedRows.results);
+  }
   const checkedAt = new Date(nowMs).toISOString();
-  for (const query of rows.results) {
+  for (const query of selected) {
     try {
       const body = await fetchApi(`${API_BASE}/2/search?${new URLSearchParams({ q: query.query, feed: "latest" })}`, `query:${query.query}`, { allowNotFoundEmpty: true });
       const page = normalizeStatusPage(body);
@@ -361,7 +443,9 @@ async function collectSearchQueries(db: D1Database, nowMs: number): Promise<numb
       logSourceFailure(`query:${query.query}`, error);
     }
   }
-  return rows.results.length;
+  const nextPosition = (start + selected.length) % total;
+  await db.batch([stateStatement(db, "search_scan_position", String(nextPosition), checkedAt)]);
+  return selected.length;
 }
 
 function logSourceFailure(source: string, error: unknown): void {
@@ -372,7 +456,8 @@ function logSourceFailure(source: string, error: unknown): void {
   }));
 }
 
-async function shouldSyncFollowing(db: D1Database, nowMs: number): Promise<boolean> {
+async function shouldSyncFollowing(db: D1Database, sourceHandle: string, nowMs: number): Promise<boolean> {
+  if (await readState(db, "following_source_handle") !== sourceHandle) return true;
   const cursor = await readState(db, "following_cursor");
   const marker = await readState(db, "following_marker");
   if (cursor || marker) return true;
@@ -385,7 +470,7 @@ async function shouldSyncFollowing(db: D1Database, nowMs: number): Promise<boole
 export async function collectOnce(env: RuntimeEnv, nowMs = Date.now()): Promise<{ following: boolean; accounts: number; queries: number }> {
   const sourceHandle = env.SOURCE_HANDLE.trim();
   let following = false;
-  if (sourceHandle && await shouldSyncFollowing(env.DB, nowMs)) {
+  if (sourceHandle && await shouldSyncFollowing(env.DB, sourceHandle, nowMs)) {
     try {
       await syncFollowingPage(env.DB, sourceHandle, nowMs);
       following = true;
