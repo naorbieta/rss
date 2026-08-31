@@ -36,6 +36,11 @@ type AccountStatusCheckpoint = {
   latest: number | null;
 };
 
+type SearchQueryCheckpoint = {
+  query: string;
+  cursor: string;
+};
+
 type DbQuery = {
   id: number;
   query: string;
@@ -69,6 +74,7 @@ const MAX_QUERIES_PER_RUN = 5;
 const MAX_FOLLOWING_UPSERTS_PER_BATCH = 50;
 const FOLLOWING_RESYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const ACCOUNT_STATUS_STATE_PREFIX = "account_status:";
+const SEARCH_QUERY_STATE_PREFIX = "search_query:";
 
 function isRecord(value: unknown): value is JsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -262,6 +268,23 @@ async function readAccountStatusCheckpoint(db: D1Database, accountId: string): P
   }
 }
 
+function searchQueryStateKey(queryId: number): string {
+  return `${SEARCH_QUERY_STATE_PREFIX}${queryId}`;
+}
+
+async function readSearchQueryCheckpoint(db: D1Database, query: DbQuery): Promise<SearchQueryCheckpoint | null> {
+  const value = await readState(db, searchQueryStateKey(query.id));
+  if (!value) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!isRecord(parsed) || parsed.query !== query.query) return null;
+    const cursor = asString(parsed.cursor);
+    return cursor ? { query: query.query, cursor } : null;
+  } catch {
+    return null;
+  }
+}
+
 function postStatement(db: D1Database, post: ApiStatus, sourceKind: "following" | "search", sourceKey: string, collectedAt: string): D1PreparedStatement {
   return db.prepare(`
     INSERT OR IGNORE INTO posts
@@ -316,9 +339,20 @@ async function saveAccountPosts(
   await db.batch(statements);
 }
 
-async function saveQueryPosts(db: D1Database, query: DbQuery, posts: ApiStatus[], checkedAt: string): Promise<void> {
-  const statements = posts.map((post) => postStatement(db, post, "search", query.query, checkedAt));
-  statements.push(db.prepare("UPDATE search_queries SET last_checked_at = ? WHERE id = ?").bind(checkedAt, query.id));
+async function saveQueryPosts(
+  db: D1Database,
+  query: DbQuery,
+  page: { statuses: ApiStatus[]; cursor: string | null },
+  checkedAt: string,
+): Promise<void> {
+  const statements = page.statuses.map((post) => postStatement(db, post, "search", query.query, checkedAt));
+  const stateKey = searchQueryStateKey(query.id);
+  if (page.cursor) {
+    statements.push(stateStatement(db, stateKey, JSON.stringify({ query: query.query, cursor: page.cursor }), checkedAt));
+  } else {
+    statements.push(db.prepare("UPDATE search_queries SET last_checked_at = ? WHERE id = ?").bind(checkedAt, query.id));
+    statements.push(db.prepare("DELETE FROM collector_state WHERE key = ?").bind(stateKey));
+  }
   await db.batch(statements);
 }
 
@@ -436,9 +470,12 @@ async function collectSearchQueries(db: D1Database, nowMs: number): Promise<numb
   const checkedAt = new Date(nowMs).toISOString();
   for (const query of selected) {
     try {
-      const body = await fetchApi(`${API_BASE}/2/search?${new URLSearchParams({ q: query.query, feed: "latest" })}`, `query:${query.query}`, { allowNotFoundEmpty: true });
+      const checkpoint = await readSearchQueryCheckpoint(db, query);
+      const params = new URLSearchParams({ q: query.query, feed: "latest" });
+      if (checkpoint?.cursor) params.set("cursor", checkpoint.cursor);
+      const body = await fetchApi(`${API_BASE}/2/search?${params}`, `query:${query.query}`, { allowNotFoundEmpty: true });
       const page = normalizeStatusPage(body);
-      await saveQueryPosts(db, query, page.statuses.filter((post) => !post.isReply), checkedAt);
+      await saveQueryPosts(db, query, { ...page, statuses: page.statuses.filter((post) => !post.isReply) }, checkedAt);
     } catch (error) {
       logSourceFailure(`query:${query.query}`, error);
     }
@@ -480,10 +517,12 @@ export async function collectOnce(env: RuntimeEnv, nowMs = Date.now()): Promise<
   }
 
   let accounts = 0;
-  try {
-    accounts = await collectAccountStatuses(env.DB, nowMs);
-  } catch (error) {
-    logSourceFailure("accounts", error);
+  if (sourceHandle) {
+    try {
+      accounts = await collectAccountStatuses(env.DB, nowMs);
+    } catch (error) {
+      logSourceFailure("accounts", error);
+    }
   }
 
   let queries = 0;

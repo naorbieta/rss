@@ -4,6 +4,17 @@ import worker, { collectOnce, normalizeStatus, syncFollowingPage } from "../src/
 
 const db = env.DB;
 const runtimeEnv = { DB: db, SOURCE_HANDLE: "" };
+const accountRuntimeEnv = { DB: db, SOURCE_HANDLE: "source" };
+
+async function markFollowingAsCurrent(): Promise<void> {
+  const timestamp = "2999-01-01T00:00:00.000Z";
+  await db.batch([
+    db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_source_handle", "source", timestamp),
+    db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_cursor", "", timestamp),
+    db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_marker", "", timestamp),
+    db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_sync_at", timestamp, timestamp),
+  ]);
+}
 
 beforeAll(async () => {
   await db.batch([
@@ -62,6 +73,7 @@ describe("FxEmbed collector", () => {
   it("collects accounts and queries, excludes replies, and checkpoints each source", async () => {
     await db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("a", "alice", "Alice", 1_699_999_900).run();
     await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("cloudflare").run();
+    await markFollowingAsCurrent();
 
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       expect(new Headers(init?.headers).get("user-agent")).toContain("rss-curator");
@@ -85,7 +97,7 @@ describe("FxEmbed collector", () => {
       return new Response("not found", { status: 404 });
     });
 
-    const result = await collectOnce(runtimeEnv, 1_700_000_100_000);
+    const result = await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
     expect(result).toEqual({ following: false, accounts: 1, queries: 1 });
     expect(fetchMock).toHaveBeenCalledTimes(2);
 
@@ -125,6 +137,7 @@ describe("FxEmbed collector", () => {
 
   it("resumes account status pagination with its fixed since checkpoint", async () => {
     await db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("a", "alice", "Alice", 1_699_999_900).run();
+    await markFollowingAsCurrent();
     const fetchMock = vi.spyOn(globalThis, "fetch");
     fetchMock.mockImplementationOnce(async (input) => {
       const parsed = new URL(String(input));
@@ -136,7 +149,7 @@ describe("FxEmbed collector", () => {
       ] }, cursor: { bottom: "page-2" } }));
     });
 
-    await collectOnce(runtimeEnv, 1_700_000_100_000);
+    await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
     expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(1_699_999_900);
     expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("account_status:a").first<{ value: string }>())?.value ?? "null")).toEqual({
       cursor: "page-2",
@@ -154,7 +167,7 @@ describe("FxEmbed collector", () => {
       ] }, cursor: { bottom: null } }));
     });
 
-    await collectOnce(runtimeEnv, 1_700_000_101_000);
+    await collectOnce(accountRuntimeEnv, 1_700_000_101_000);
     expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(1_700_000_000);
     expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("account_status:a").first<{ count: number }>())?.count).toBe(0);
     expect((await db.prepare("SELECT id FROM posts ORDER BY id").all<{ id: string }>()).results.map((post) => post.id)).toEqual(["new", "older"]);
@@ -162,6 +175,7 @@ describe("FxEmbed collector", () => {
 
   it("keeps an account status cursor unchanged when its next page fails", async () => {
     await db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("a", "alice", "Alice", 1_699_999_900).run();
+    await markFollowingAsCurrent();
     const fetchMock = vi.spyOn(globalThis, "fetch");
     fetchMock
       .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [
@@ -169,8 +183,8 @@ describe("FxEmbed collector", () => {
       ] }, cursor: { bottom: "page-2" } })))
       .mockResolvedValueOnce(new Response("upstream failed", { status: 500 }));
 
-    await collectOnce(runtimeEnv, 1_700_000_100_000);
-    await collectOnce(runtimeEnv, 1_700_000_101_000);
+    await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
+    await collectOnce(accountRuntimeEnv, 1_700_000_101_000);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(1_699_999_900);
     expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("account_status:a").first<{ value: string }>())?.value ?? "null")).toMatchObject({ cursor: "page-2" });
@@ -223,10 +237,11 @@ describe("FxEmbed collector", () => {
 
   it("treats status 204 as a successful empty check", async () => {
     await db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("a", "alice", "Alice", 1_699_999_900).run();
+    await markFollowingAsCurrent();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
 
     const checkedAt = 1_700_000_100_000;
-    expect((await collectOnce(runtimeEnv, checkedAt)).accounts).toBe(1);
+    expect((await collectOnce(accountRuntimeEnv, checkedAt)).accounts).toBe(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const account = await db.prepare("SELECT last_post_timestamp, last_checked_at FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number; last_checked_at: string }>();
     expect(account).toEqual({ last_post_timestamp: 1_699_999_900, last_checked_at: "2023-11-14T22:15:00.000Z" });
@@ -237,16 +252,17 @@ describe("FxEmbed collector", () => {
       const handle = `h${String(index).padStart(2, "0")}`;
       await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind(handle, handle, handle).run();
     }
+    await markFollowingAsCurrent();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const parsed = new URL(String(input));
       if (parsed.pathname.endsWith("/h00/statuses")) return new Response("failed", { status: 500 });
       return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } }));
     });
 
-    await collectOnce(runtimeEnv, 1_700_000_100_000);
+    await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
     expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_scan_position").first<{ value: string }>())?.value).toBe("20");
     fetchMock.mockClear();
-    await collectOnce(runtimeEnv, 1_700_000_101_000);
+    await collectOnce(accountRuntimeEnv, 1_700_000_101_000);
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toContain("/2/profile/h20/statuses");
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toContain("/2/profile/h00/statuses");
   });
@@ -279,6 +295,100 @@ describe("FxEmbed collector", () => {
     await collectOnce(runtimeEnv, 1_700_000_101_000);
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).searchParams.get("q"))).toEqual(["q6", "q1", "q2", "q3", "q4"]);
     expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE query = ?").bind("q6").first<{ last_checked_at: string }>())?.last_checked_at).toBe("2023-11-14T22:15:01.000Z");
+  });
+
+  it("resumes search pagination and checkpoints only its final page", async () => {
+    await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("cursor-query").run();
+    const queryRow = await db.prepare("SELECT id FROM search_queries WHERE query = ?").bind("cursor-query").first<{ id: number }>();
+    const queryId = queryRow?.id;
+    expect(queryId).toBeDefined();
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    fetchMock.mockImplementationOnce(async (input) => {
+      const parsed = new URL(String(input));
+      expect(parsed.pathname).toBe("/2/search");
+      expect(parsed.searchParams.get("q")).toBe("cursor-query");
+      expect(parsed.searchParams.get("feed")).toBe("latest");
+      expect(parsed.searchParams.get("cursor")).toBeNull();
+      return new Response(JSON.stringify({ results: { timeline: [
+        { id: "search-1", url: "https://x.com/a/status/search-1", text: "1", created_timestamp: 1_700_000_000, author: { id: "a", screen_name: "alice", name: "Alice" } },
+      ] }, cursor: { bottom: "search-page-2" } }));
+    });
+
+    await collectOnce(runtimeEnv, 1_700_000_100_000);
+    expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE id = ?").bind(queryId).first<{ last_checked_at: string | null }>())?.last_checked_at).toBeNull();
+    expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind(`search_query:${queryId}`).first<{ value: string }>())?.value ?? "null")).toEqual({
+      query: "cursor-query",
+      cursor: "search-page-2",
+    });
+
+    fetchMock.mockImplementationOnce(async (input) => {
+      const parsed = new URL(String(input));
+      expect(parsed.pathname).toBe("/2/search");
+      expect(parsed.searchParams.get("q")).toBe("cursor-query");
+      expect(parsed.searchParams.get("cursor")).toBe("search-page-2");
+      return new Response(JSON.stringify({ results: { timeline: [
+        { id: "search-2", url: "https://x.com/a/status/search-2", text: "2", created_timestamp: 1_700_000_001, author: { id: "a", screen_name: "alice", name: "Alice" } },
+      ] }, cursor: { bottom: null } }));
+    });
+
+    await collectOnce(runtimeEnv, 1_700_000_101_000);
+    expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE id = ?").bind(queryId).first<{ last_checked_at: string }>())?.last_checked_at).toBe("2023-11-14T22:15:01.000Z");
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind(`search_query:${queryId}`).first<{ count: number }>())?.count).toBe(0);
+    expect((await db.prepare("SELECT id FROM posts ORDER BY id").all<{ id: string }>()).results.map((post) => post.id)).toEqual(["search-1", "search-2"]);
+  });
+
+  it("keeps a search cursor when its next page fails", async () => {
+    await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("failed-cursor-query").run();
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: "search-page-2" } })))
+      .mockResolvedValueOnce(new Response("upstream failed", { status: 500 }));
+
+    await collectOnce(runtimeEnv, 1_700_000_100_000);
+    await collectOnce(runtimeEnv, 1_700_000_101_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key LIKE ?").bind("search_query:%").first<{ value: string }>())?.value).toContain("search-page-2");
+    expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE query = ?").bind("failed-cursor-query").first<{ last_checked_at: string | null }>())?.last_checked_at).toBeNull();
+  });
+
+  it("resets a saved search cursor when the query text changes", async () => {
+    await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("old-query").run();
+    const queryRow = await db.prepare("SELECT id FROM search_queries WHERE query = ?").bind("old-query").first<{ id: number }>();
+    const queryId = queryRow?.id;
+    expect(queryId).toBeDefined();
+    await db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind(
+      `search_query:${queryId}`,
+      JSON.stringify({ query: "old-query", cursor: "stale-cursor" }),
+      "2023-11-14T22:00:00.000Z",
+    ).run();
+    await db.prepare("UPDATE search_queries SET query = ? WHERE id = ?").bind("new-query", queryId).run();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const parsed = new URL(String(input));
+      expect(parsed.pathname).toBe("/2/search");
+      expect(parsed.searchParams.get("q")).toBe("new-query");
+      expect(parsed.searchParams.get("cursor")).toBeNull();
+      return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } }));
+    });
+
+    await collectOnce(runtimeEnv, 1_700_000_100_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind(`search_query:${queryId}`).first<{ count: number }>())?.count).toBe(0);
+  });
+
+  it("skips saved account statuses when SOURCE_HANDLE is blank but still searches", async () => {
+    await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind("a", "alice", "Alice").run();
+    await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("still-searches").run();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const parsed = new URL(String(input));
+      expect(parsed.pathname).toBe("/2/search");
+      expect(parsed.searchParams.get("q")).toBe("still-searches");
+      return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } }));
+    });
+
+    const result = await collectOnce(runtimeEnv, 1_700_000_100_000);
+    expect(result).toEqual({ following: false, accounts: 0, queries: 1 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE query = ?").bind("still-searches").first<{ last_checked_at: string }>())?.last_checked_at).toBe("2023-11-14T22:15:00.000Z");
   });
 
   it("runs collection from the scheduled handler", async () => {
