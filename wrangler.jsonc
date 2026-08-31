@@ -7,6 +7,9 @@
   "vars": {
     "SOURCE_HANDLE": ""
   },
+  "secrets": {
+    "required": ["ADMIN_TOKEN"]
+  },
   "d1_databases": [
     {
       "binding": "DB",

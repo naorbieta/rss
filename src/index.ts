@@ -54,6 +54,11 @@ type DbQuery = {
   last_checked_at: string | null;
 };
 
+type ManagedQuery = {
+  query: string;
+  last_checked_at: string | null;
+};
+
 type DbFeedRow = {
   id: string;
   url: string;
@@ -71,8 +76,8 @@ type DbFeedRow = {
   source_key: string;
 };
 
-type WorkerEnv = { DB: D1Database; SOURCE_HANDLE: string };
-type RuntimeEnv = WorkerEnv;
+type WorkerEnv = Cloudflare.Env;
+type RuntimeEnv = Pick<WorkerEnv, "DB"> & { SOURCE_HANDLE: string };
 
 const API_BASE = "https://api.fxtwitter.com";
 const FETCH_TIMEOUT_MS = 10_000;
@@ -81,6 +86,9 @@ const STATUS_API_COUNT = 6;
 const SEARCH_API_COUNT = 6;
 const MAX_ACCOUNTS_PER_RUN = 2;
 const MAX_QUERIES_PER_RUN = 3;
+const MAX_MANAGED_QUERIES = 20;
+const MAX_QUERY_LENGTH = 200;
+const MAX_QUERY_BODY_BYTES = 32 * 1024;
 const FOLLOWING_RESYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // No-following runs make at most 10 upstream requests (2 accounts + 3 queries, each fresh/backlog), so 100 seconds at timeout; the 10-minute lease is ample and below the 15-minute Cron interval.
 const COLLECTION_LEASE_MS = 10 * 60 * 1000;
@@ -907,11 +915,132 @@ export async function collectOnce(env: RuntimeEnv, nowMs = Date.now()): Promise<
   }
 }
 
-function json(value: unknown, status = 200): Response {
+function json(value: unknown, status = 200, headers?: HeadersInit): Response {
+  const responseHeaders = new Headers(headers);
+  responseHeaders.set("content-type", "application/json; charset=utf-8");
   return new Response(JSON.stringify(value), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8" },
+    headers: responseHeaders,
   });
+}
+
+async function hasAdminAccess(request: Request, expectedToken: string): Promise<boolean> {
+  const authorization = request.headers.get("authorization") ?? "";
+  const providedToken = authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : "";
+  const encoder = new TextEncoder();
+  // Vitest also loads Node's WebCrypto type, which omits this Workers runtime method.
+  const subtle = crypto.subtle as typeof crypto.subtle & {
+    timingSafeEqual(a: ArrayBuffer | ArrayBufferView, b: ArrayBuffer | ArrayBufferView): boolean;
+  };
+  const [providedHash, expectedHash] = await Promise.all([
+    subtle.digest("SHA-256", encoder.encode(providedToken)),
+    subtle.digest("SHA-256", encoder.encode(expectedToken)),
+  ]);
+  return subtle.timingSafeEqual(providedHash, expectedHash);
+}
+
+async function readBoundedBody(request: Request): Promise<Uint8Array | null> {
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_QUERY_BODY_BYTES) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+async function listManagedQueries(db: D1Database): Promise<ManagedQuery[]> {
+  const rows = await db.prepare(`
+    SELECT query, last_checked_at
+    FROM search_queries
+    WHERE enabled = 1
+    ORDER BY id
+  `).all<ManagedQuery>();
+  return rows.results;
+}
+
+async function replaceManagedQueries(request: Request, env: WorkerEnv): Promise<Response> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+  if (contentType !== "application/json") {
+    return json({ error: "unsupported_media_type", message: "Content-Type は application/json を指定してください" }, 415);
+  }
+  const contentLength = Number(request.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > MAX_QUERY_BODY_BYTES) {
+    return json({ error: "payload_too_large", message: `リクエスト本文は ${MAX_QUERY_BODY_BYTES} bytes 以下にしてください` }, 413);
+  }
+  const bytes = await readBoundedBody(request);
+  if (bytes === null) {
+    return json({ error: "payload_too_large", message: `リクエスト本文は ${MAX_QUERY_BODY_BYTES} bytes 以下にしてください` }, 413);
+  }
+
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    return json({ error: "invalid_json", message: "有効な JSON を送信してください" }, 400);
+  }
+  if (!isRecord(value) || !Array.isArray(value.queries)) {
+    return json({ error: "invalid_queries", message: "queries は文字列の配列で指定してください" }, 400);
+  }
+  if (value.queries.length > MAX_MANAGED_QUERIES) {
+    return json({ error: "invalid_queries", message: `queries は ${MAX_MANAGED_QUERIES} 件以下にしてください` }, 400);
+  }
+
+  const queries: string[] = [];
+  for (const item of value.queries) {
+    if (typeof item !== "string" || !item.trim() || Array.from(item.trim()).length > MAX_QUERY_LENGTH) {
+      return json({ error: "invalid_queries", message: `各検索語は1〜${MAX_QUERY_LENGTH}文字の文字列にしてください` }, 400);
+    }
+    queries.push(item.trim());
+  }
+  if (new Set(queries.map((query) => query.toLowerCase())).size !== queries.length) {
+    return json({ error: "invalid_queries", message: "queries に重複した検索語を指定しないでください" }, 400);
+  }
+
+  const statements = [env.DB.prepare("UPDATE search_queries SET enabled = 0 WHERE enabled = 1")];
+  if (queries.length) {
+    statements.push(env.DB.prepare(`
+      INSERT INTO search_queries (query, enabled) VALUES ${queries.map(() => "(?, 1)").join(", ")}
+      ON CONFLICT(query) DO UPDATE SET enabled = 1
+    `).bind(...queries));
+  }
+  await env.DB.batch(statements);
+  return json({ queries: await listManagedQueries(env.DB) });
+}
+
+async function manageQueries(request: Request, env: WorkerEnv): Promise<Response> {
+  if (request.method !== "GET" && request.method !== "PUT") {
+    return json({ error: "method_not_allowed", message: "GET または PUT を使用してください" }, 405, { allow: "GET, PUT" });
+  }
+  if (!env.ADMIN_TOKEN) {
+    console.error(JSON.stringify({ event: "configuration_error", binding: "ADMIN_TOKEN" }));
+    return json({ error: "configuration_error", message: "ADMIN_TOKEN が設定されていません" }, 500);
+  }
+  if (!await hasAdminAccess(request, env.ADMIN_TOKEN)) {
+    return json({ error: "unauthorized", message: "有効な Bearer token を指定してください" }, 401, {
+      "www-authenticate": 'Bearer realm="queries"',
+    });
+  }
+  if (request.method === "GET") return json({ queries: await listManagedQueries(env.DB) });
+  return replaceManagedQueries(request, env);
 }
 
 function parsePositiveNumber(value: string | null, fallback: number): number | null {
@@ -978,6 +1107,7 @@ const worker = {
     try {
       const url = new URL(request.url);
       if (request.method === "GET" && url.pathname === "/feed") return await feed(request, env);
+      if (url.pathname === "/queries") return await manageQueries(request, env);
       return json({ error: "not_found" }, 404);
     } catch (error) {
       console.error(JSON.stringify({ event: "request_failed", error: error instanceof Error ? error.message : String(error) }));

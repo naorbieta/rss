@@ -5,6 +5,7 @@ import worker, { collectOnce, normalizeStatus, syncFollowingPage } from "../src/
 const db = env.DB;
 const runtimeEnv = { DB: db, SOURCE_HANDLE: "" };
 const accountRuntimeEnv = { DB: db, SOURCE_HANDLE: "source" };
+const adminRuntimeEnv = { DB: db, SOURCE_HANDLE: "", ADMIN_TOKEN: "test-admin-token" } as const;
 
 async function markFollowingAsCurrent(): Promise<void> {
   const timestamp = "2999-01-01T00:00:00.000Z";
@@ -1337,7 +1338,7 @@ describe("FxEmbed collector", () => {
     await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("scheduled").run();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ code: 200, results: { timeline: [] }, cursor: { bottom: null } })));
 
-    await worker.scheduled({ scheduledTime: 1_700_000_100_000, cron: "*/15 * * * *", noRetry() {} }, runtimeEnv);
+    await worker.scheduled({ scheduledTime: 1_700_000_100_000, cron: "*/15 * * * *", noRetry() {} }, adminRuntimeEnv);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE query = ?").bind("scheduled").first<{ last_checked_at: string }>())?.last_checked_at).toBe("2023-11-14T22:15:00.000Z");
@@ -1390,5 +1391,87 @@ describe("feed", () => {
   it("rejects invalid pagination", async () => {
     const response = await worker.fetch(new Request("https://localhost/feed?page=0&limit=101"), env);
     expect(response.status).toBe(400);
+  });
+});
+
+describe("queries", () => {
+  function request(path: string, init: RequestInit = {}): Request {
+    const headers = new Headers(init.headers);
+    headers.set("authorization", `Bearer ${adminRuntimeEnv.ADMIN_TOKEN}`);
+    return new Request(`https://localhost${path}`, { ...init, headers });
+  }
+
+  it("requires the configured bearer token", async () => {
+    await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("keep").run();
+
+    const missing = await worker.fetch(new Request("https://localhost/queries"), adminRuntimeEnv);
+    expect(missing.status).toBe(401);
+    expect(missing.headers.get("www-authenticate")).toBe('Bearer realm="queries"');
+
+    const wrong = await worker.fetch(new Request("https://localhost/queries", {
+      headers: { authorization: "Bearer wrong-token" },
+    }), adminRuntimeEnv);
+    expect(wrong.status).toBe(401);
+    expect((await db.prepare("SELECT enabled FROM search_queries WHERE query = ?").bind("keep").first<{ enabled: number }>())?.enabled).toBe(1);
+  });
+
+  it("lists and atomically replaces the active search terms", async () => {
+    await db.batch([
+      db.prepare("INSERT INTO search_queries (query, enabled, last_checked_at) VALUES (?, 1, ?)").bind("Cloudflare Workers", "2026-08-31T00:00:00.000Z"),
+      db.prepare("INSERT INTO search_queries (query, enabled) VALUES (?, 1)").bind("old query"),
+      db.prepare("INSERT INTO search_queries (query, enabled) VALUES (?, 0)").bind("disabled query"),
+    ]);
+
+    const before = await worker.fetch(request("/queries"), adminRuntimeEnv);
+    expect(before.status).toBe(200);
+    expect(await before.json()).toEqual({ queries: [
+      { query: "Cloudflare Workers", last_checked_at: "2026-08-31T00:00:00.000Z" },
+      { query: "old query", last_checked_at: null },
+    ] });
+
+    const replaced = await worker.fetch(request("/queries", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ queries: [" Cloudflare Workers ", "Astro web framework"] }),
+    }), adminRuntimeEnv);
+    expect(replaced.status).toBe(200);
+    expect(await replaced.json()).toEqual({ queries: [
+      { query: "Cloudflare Workers", last_checked_at: "2026-08-31T00:00:00.000Z" },
+      { query: "Astro web framework", last_checked_at: null },
+    ] });
+    expect((await db.prepare("SELECT query, enabled FROM search_queries ORDER BY id").all<{ query: string; enabled: number }>()).results).toEqual([
+      { query: "Cloudflare Workers", enabled: 1 },
+      { query: "old query", enabled: 0 },
+      { query: "disabled query", enabled: 0 },
+      { query: "Astro web framework", enabled: 1 },
+    ]);
+
+    const emptied = await worker.fetch(request("/queries", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ queries: [] }),
+    }), adminRuntimeEnv);
+    expect(await emptied.json()).toEqual({ queries: [] });
+  });
+
+  it("rejects invalid and oversized replacements without changing the active terms", async () => {
+    await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("keep").run();
+
+    const duplicate = await worker.fetch(request("/queries", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ queries: ["Cloudflare", " cloudflare "] }),
+    }), adminRuntimeEnv);
+    expect(duplicate.status).toBe(400);
+
+    const oversized = await worker.fetch(request("/queries", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ queries: ["x".repeat(33_000)] }),
+    }), adminRuntimeEnv);
+    expect(oversized.status).toBe(413);
+    expect((await db.prepare("SELECT query, enabled FROM search_queries").all<{ query: string; enabled: number }>()).results).toEqual([
+      { query: "keep", enabled: 1 },
+    ]);
   });
 });

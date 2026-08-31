@@ -1,6 +1,6 @@
 # X 投稿フィード Worker
 
-これはローカル完結の MVP です。まずローカルで試します。対象は following と検索語です。FxEmbed API v2 の結果を Cloudflare D1 に保存します。ChatGPT から読める JSON を返す最小構成の Worker です。初回は「セットアップ」「収集」「feed」の順に読み、障害時の動きと用語集は必要なときに参照してください。
+これは Cloudflare Workers で動かす X 投稿収集 Worker です。まずローカルで試します。対象は following と検索語です。FxEmbed API v2 の結果を Cloudflare D1 に保存し、ChatGPT から読み書きできる JSON API を提供します。初回は「セットアップ」「検索語を管理する」「収集」「feed」の順に読み、障害時の動きと用語集は必要なときに参照してください。
 
 ## セットアップ
 
@@ -12,23 +12,32 @@ npm run types
 npx wrangler d1 migrations apply rss-curator --local
 ```
 
-`SOURCE_HANDLE` は `wrangler.jsonc` の空文字が既定値です。一覧を使う場合は、ローカルだけなら `.dev.vars` に次のように書きます（このファイルは Git に入りません）。
+検索語の変更APIは `ADMIN_TOKEN` で保護します。ローカルでは `.dev.vars` に推測されにくい値を設定します。このファイルは Git に入りません。`SOURCE_HANDLE` は空文字のままでも検索語の収集だけを利用できます。
 
 ```text
+ADMIN_TOKEN=推測されにくい値
 SOURCE_HANDLE=your_handle
 ```
 
-Wrangler の設定値を変更したら `npm run types` をもう一度実行してください。デプロイはこの MVP の手順に含めません。
+Workersへ配置するときは、同じ名前の `ADMIN_TOKEN` を Workers Secret として設定します。平文の `vars` には置きません。Wrangler の設定値を変更したら `npm run types` をもう一度実行してください。
 
-## 検索語を追加する
+## 検索語を管理する
 
-有効な検索語は D1 の `search_queries` に登録します。初回の追加例は次のとおりです。
+`GET /queries` は現在有効な検索語を返します。`PUT /queries` は有効な検索語全体を置き換えます。どちらも `ADMIN_TOKEN` が必要です。
 
 ```sh
-npx wrangler d1 execute rss-curator --local --command "INSERT INTO search_queries (query) VALUES ('cloudflare')"
+curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:8787/queries"
+
+curl -X PUT \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"queries":["OpenAI Codex","Cloudflare Workers","Astro web framework"]}' \
+  "http://localhost:8787/queries"
 ```
 
-無効化・再有効化は `enabled` を `0`・`1` に更新します。Cron 1 回につき、保存済みの巡回位置から最大 3 件を処理します。各検索語は毎回 cursor なしの `feed=latest` を先に 1 ページ取得して保存し、途中の backlog cursor があれば続けて 1 ページ取得します。latest の取得成功時に `last_checked_at` を更新し、backlog 用 cursor は別の `collector_state` に保存します。backlog 中に fresh で新しい cursor が見つかった場合は `queued_cursor` に待機させ、現在の backlog が終端または stop watermark に到達してから切り替えます。最新ページで確認した投稿時刻が前回完了時の stop watermark より新しいとき、または同じ秒の未確認 ID があるときだけ backlog を開始し、stop watermark の既知 ID に到達するか終端になるまで続けます。巡回位置は成功・失敗にかかわらず進みます。`search_queries.query` を変更すると、古い state を使わず初回ページから再開します。
+検索語は最大20件、1件につき200文字までです。同じ検索語は、大文字・小文字だけを変えても重複指定できません。空の配列を送ると検索語による収集をすべて停止します。置き換え前に収集した投稿は削除せず、指定した `hours` の期間中は feed に残ります。新しい検索語は次回の Cron から収集されます。
+
+Cron 1 回につき、保存済みの巡回位置から最大 3 件を処理します。各検索語は毎回 cursor なしの `feed=latest` を先に 1 ページ取得して保存し、途中の backlog cursor があれば続けて 1 ページ取得します。latest の取得成功時に `last_checked_at` を更新し、backlog 用 cursor は別の `collector_state` に保存します。backlog 中に fresh で新しい cursor が見つかった場合は `queued_cursor` に待機させ、現在の backlog が終端または stop watermark に到達してから切り替えます。最新ページで確認した投稿時刻が前回完了時の stop watermark より新しいとき、または同じ秒の未確認 ID があるときだけ backlog を開始し、stop watermark の既知 ID に到達するか終端になるまで続けます。巡回位置は成功・失敗にかかわらず進みます。同じ検索語を再び有効にすると、保存済みの収集位置から再開します。
 
 ## 収集を動かす
 
@@ -80,7 +89,9 @@ curl "http://localhost:8787/feed?page=1&limit=100&hours=24"
 
 ## ChatGPT から依頼する例
 
-まず `GET /feed` の JSON を取得し、その `posts` をそのまま次のように渡します。
+検索語を変える場合は、ChatGPTが `GET /queries` で現在値を確認し、会話から選んだ検索語全体を `PUT /queries` へ送ります。通常のChatGPTから呼び出すには、このWorkerのURLと `ADMIN_TOKEN` を利用できるコネクタまたはツールが必要です。トークンを会話本文へ貼り付けないでください。
+
+推薦を受ける場合は `GET /feed` の JSON を取得し、その `posts` を次のように渡します。
 
 > `/feed?page=1&limit=100&hours=24` の posts を読み、重要度・新規性・私の関心との関連で候補を選んでください。各候補について、投稿 ID、URL、要約、推薦理由を返してください。候補がなければ「該当なし」と理由を書いてください。引用投稿は本文と quote の両方を比較してください。
 
