@@ -403,7 +403,9 @@ async function saveAccountFresh(
       : page.cursor === checkpoint.cursor ? checkpoint.queuedCursor : page.cursor;
     next = { ...checkpoint, queuedCursor, latest };
   } else if (account.last_post_timestamp === null) {
-    statements.push(db.prepare("UPDATE accounts SET last_post_timestamp = CASE WHEN ? > 0 THEN ? ELSE last_post_timestamp END, last_checked_at = ? WHERE id = ?").bind(latest ?? 0, latest, checkedAt, account.id));
+    const baseline = Math.floor(Date.parse(checkedAt) / 1000);
+    const initialLatest = latest ?? (Number.isFinite(baseline) && baseline > 0 ? baseline : null);
+    statements.push(db.prepare("UPDATE accounts SET last_post_timestamp = CASE WHEN ? > 0 THEN ? ELSE last_post_timestamp END, last_checked_at = ? WHERE id = ?").bind(initialLatest ?? 0, initialLatest, checkedAt, account.id));
   } else if (page.cursor && latest !== null && latest > account.last_post_timestamp) {
     next = { cursor: page.cursor, queuedCursor: null, since: account.last_post_timestamp, latest };
   } else {
@@ -524,9 +526,9 @@ async function saveSearchLatest(
     if (checkpoint.backlogCursor) {
       next = { ...checkpoint, pendingLatest, pendingLatestIds };
     } else if (
-      latest !== null && checkpoint.stopWatermark !== null &&
-      (latest > checkpoint.stopWatermark || (latest === checkpoint.stopWatermark && statusIdsAtTimestamp(page.statuses, latest).some((id) => !checkpoint.stopIds.includes(id)))) &&
-      page.cursor
+      latest !== null && page.cursor &&
+      (checkpoint.stopWatermark === null || latest > checkpoint.stopWatermark ||
+        (latest === checkpoint.stopWatermark && statusIdsAtTimestamp(page.statuses, latest).some((id) => !checkpoint.stopIds.includes(id))))
     ) {
       next = { ...checkpoint, backlogCursor: page.cursor, pendingLatest, pendingLatestIds };
     } else {

@@ -789,6 +789,38 @@ describe("FxEmbed collector", () => {
     expect(account).toEqual({ last_post_timestamp: 1_699_999_900, last_checked_at: "2023-11-14T22:15:00.000Z" });
   });
 
+  it("uses an empty initial status check time as the next since baseline", async () => {
+    await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind("a", "alice", "Alice").run();
+    await markFollowingAsCurrent();
+    const status = (id: string, timestamp: number) => ({ id, url: `https://x.com/alice/status/${id}`, text: id, created_timestamp: timestamp, author: { id: "a", screen_name: "alice", name: "Alice" } });
+    const checkedAt = 1_700_000_100_000;
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await collectOnce(accountRuntimeEnv, checkedAt);
+    expect((await db.prepare("SELECT last_post_timestamp, last_checked_at FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number; last_checked_at: string }>())).toEqual({
+      last_post_timestamp: 1_700_000_100,
+      last_checked_at: "2023-11-14T22:15:00.000Z",
+    });
+
+    fetchMock.mockImplementationOnce(async (input) => {
+      const parsed = new URL(String(input));
+      expect(parsed.searchParams.get("since")).toBe("1700000100");
+      expect(parsed.searchParams.get("cursor")).toBeNull();
+      return new Response(JSON.stringify({ results: { timeline: Array.from({ length: 6 }, (_, index) => status(`fresh-${index}`, 1_700_000_101 + index)) }, cursor: { bottom: "account-history" } }));
+    });
+    fetchMock.mockImplementationOnce(async (input) => {
+      const parsed = new URL(String(input));
+      expect(parsed.searchParams.get("since")).toBe("1700000100");
+      expect(parsed.searchParams.get("cursor")).toBe("account-history");
+      return new Response(JSON.stringify({ results: { timeline: Array.from({ length: 6 }, (_, index) => status(`older-${index}`, 1_700_000_100 + index)) }, cursor: { bottom: null } }));
+    });
+    await collectOnce(accountRuntimeEnv, checkedAt + 60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(12);
+    expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(1_700_000_106);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("account_status:a").first<{ count: number }>())?.count).toBe(0);
+  });
+
   it("advances the batch position after a failed account and retries it next cycle", async () => {
     for (let index = 0; index < 4; index += 1) {
       const handle = `h${String(index).padStart(2, "0")}`;
@@ -823,7 +855,7 @@ describe("FxEmbed collector", () => {
     expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE query = ?").bind("missing").first<{ last_checked_at: string }>())?.last_checked_at).toBe("2023-11-14T22:15:00.000Z");
   });
 
-  it("establishes a watermark instead of starting backlog after empty latest", async () => {
+  it("drains backlog after an empty latest checkpoint and does not restart it", async () => {
     await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("empty-then-new").run();
     const queryRow = await db.prepare("SELECT id FROM search_queries WHERE query = ?").bind("empty-then-new").first<{ id: number }>();
     const queryId = queryRow?.id;
@@ -835,18 +867,36 @@ describe("FxEmbed collector", () => {
     fetchMock.mockImplementationOnce(async (input) => {
       const parsed = new URL(String(input));
       expect(parsed.searchParams.get("cursor")).toBeNull();
-      return new Response(JSON.stringify({ results: { timeline: statusFixture("new-latest", 1) }, cursor: { bottom: "old-history" } }));
+      return new Response(JSON.stringify({ results: { timeline: statusFixture("new-latest", 6) }, cursor: { bottom: "old-history" } }));
     });
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: Array.from({ length: 6 }, (_, index) => ({
+      id: `old-page-1-${index}`, url: `https://x.com/a/status/old-page-1-${index}`, text: "過去1", created_timestamp: 1_699_999_994 + index,
+      author: { id: "a", screen_name: "alice", name: "Alice" },
+    })) }, cursor: { bottom: "older-history" } })));
     await collectOnce(runtimeEnv, 1_700_000_101_000);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(12);
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: statusFixture("new-latest", 6) }, cursor: { bottom: "old-history" } })));
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: Array.from({ length: 6 }, (_, index) => ({
+      id: `old-page-2-${index}`, url: `https://x.com/a/status/old-page-2-${index}`, text: "過去2", created_timestamp: 1_699_999_988 + index,
+      author: { id: "a", screen_name: "alice", name: "Alice" },
+    })) }, cursor: { bottom: null } })));
+    await collectOnce(runtimeEnv, 1_700_000_102_000);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(18);
     expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind(`search_query:${queryId}`).first<{ value: string }>())?.value ?? "null")).toEqual({
       query: "empty-then-new",
       backlog_cursor: null,
-      stop_watermark: 1_700_000_000,
-      stop_ids: ["new-latest-0"],
+      stop_watermark: 1_700_000_005,
+      stop_ids: ["new-latest-5"],
       pending_latest: null,
       pending_latest_ids: [],
     });
+
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: statusFixture("new-latest", 6) }, cursor: { bottom: "should-not-start" } })));
+    await collectOnce(runtimeEnv, 1_700_000_103_000);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(18);
   });
 
   it("rotates search attempts after three persistent failures", async () => {
