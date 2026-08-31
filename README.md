@@ -39,9 +39,11 @@ npx wrangler dev --test-scheduled
 curl "http://localhost:8787/__scheduled?cron=*/15+*+*+*+*"
 ```
 
-収集全体は期限10分のリースで直列化します。重複実行は安全に何もせず、実行プロセスが終了してもリースの期限後に再取得できます。
+収集全体は実行開始時刻を基準に期限10分のリースで直列化します。重複実行は安全に何もせず、実行プロセスが終了してもリースの期限後に再取得できます。
 
-1 回の実行には上限があります。following は 1 ページ、アカウントは最大 20 件、検索語は最大 5 件です。following の source handle、cursor、full sync marker、巡回位置、最終同期時刻は `collector_state` に保存します。`SOURCE_HANDLE` を変更した場合は、古い cursor と marker を使わず新しい full sync を開始し、完了するまで保存済みアカウントの status 取得を止めます。空の `SOURCE_HANDLE` では following と保存済みアカウントの status 取得を止めますが、検索語の収集と保存済みアカウントは維持します。full sync 完了後は24時間待ち、途中の同期だけ毎回1ページ進めます。アカウントの status 取得も1アカウント1ページとし、ページ途中の cursor、固定した `since`、取得済みページの最新時刻を `collector_state` に保存して次回へ続けます。protected アカウントは保存しますが、status は取得しません。
+1 回の実行には上限があります。following は 1 ページ、アカウントは最大 3 件、検索語は最大 5 件です。FxEmbed APIには following の `count=20`、status と検索の `count=6` を指定します。上流がこの件数を超えて返した場合は source 失敗として保存を進めません。following の source handle、cursor、full sync marker、巡回位置、最終同期時刻は `collector_state` に保存します。`SOURCE_HANDLE` を変更した場合は、古い cursor と marker を使わず新しい full sync を開始し、SOURCE_HANDLE変更時または24時間再同期時の full sync が完了するまで保存済みアカウントの status 取得を止めます。空の `SOURCE_HANDLE` では following と保存済みアカウントの status 取得を止めますが、検索語の収集と保存済みアカウントは維持します。full sync 完了後は24時間待ち、途中の同期だけ毎回1ページ進めます。following を試みた実行では、成功・失敗にかかわらずアカウントの status 取得を行わず、次回 Cron 以降に回します。following を試みない実行では、アカウントの status 取得を1アカウント1ページとし、ページ途中の cursor、固定した `since`、取得済みページの最新時刻を `collector_state` に保存して次回へ続けます。protected アカウントは保存しますが、status は取得しません。
+
+D1 Free の1回の Worker invocation あたりのクエリ上限は50です（[Cloudflare公式の制限](https://developers.cloudflare.com/d1/platform/limits/)）。このWorkerはD1クエリを最大49件に抑え、followingのアカウントと各ページの投稿は、上限100 bound parameters内のmulti-row SQLで保存します。
 
 ## feed を読む
 
@@ -85,9 +87,9 @@ curl "http://localhost:8787/feed?page=1&limit=100&hours=24"
 
 ## 障害時の動き
 
-外部 API の timeout・HTTP エラー・形式不正は source 単位で構造化ログに記録します。ほかのアカウントと検索語の処理は続けます。status の 204 は「新着なし」として成功扱いにし、アカウントの `last_checked_at` だけを更新します。status のページ途中で失敗した場合は cursor を保持します。固定した `since` のページを次回再試行します。`last_post_timestamp` は最後のページまで成功したときだけ進みます。検索語もページ途中で失敗した場合は cursor を保持します。最後のページまで成功するまで `last_checked_at` を進めません。失敗したアカウントの時刻は進めませんが、選択した batch の巡回位置は進め、次の巡回で再試行します。検索結果の「404 + code:404 + 空の results」は新着なしとして checkpoint を更新します。検索語の巡回位置も成功・失敗にかかわらず進むため、失敗した検索語が後続の検索語を占有しません。SOURCE_HANDLE変更後の following full sync が失敗中または途中の場合は、旧アカウントの status 取得を行いません。following full sync は全ページが成功した最後のページでだけ、前回同期にしか存在しないアカウントを削除します。収集全体の重複実行は期限付きリースで直列化し、取得できない実行は何もせず、プロセス異常終了後は期限切れで再開します。
+外部 API の timeout・HTTP エラー・形式不正は source 単位で構造化ログに記録します。ほかのアカウントと検索語の処理は続けます。status の 204 は「新着なし」として成功扱いにし、アカウントの `last_checked_at` だけを更新します。status のページ途中で失敗した場合は cursor を保持します。固定した `since` のページを次回再試行します。`last_post_timestamp` は最後のページまで成功したときだけ進みます。検索語もページ途中で失敗した場合は cursor を保持します。最後のページまで成功するまで `last_checked_at` を進めません。失敗したアカウントの時刻は進めませんが、選択した batch の巡回位置は進め、次の巡回で再試行します。検索結果の「404 + code:404 + 空の results」は新着なしとして checkpoint を更新します。検索語の巡回位置も成功・失敗にかかわらず進むため、失敗した検索語が後続の検索語を占有しません。full sync が失敗中または途中の場合は、旧アカウントの status 取得を行いません。following full sync は全ページが成功した最後のページでだけ、前回同期にしか存在しないアカウントを削除します。収集全体の重複実行は期限付きリースで直列化し、取得できない実行は何もせず、プロセス異常終了後は期限切れで再開します。
 
-投稿は X 投稿 ID を主キーに `INSERT OR IGNORE` で保存します。同じ Cron が重複実行されても、投稿と checkpoint は重複しません。投稿保存と各 source の checkpoint は同じ D1 batch で更新します。following のアカウント upsert は複数の小さな batch に分けます。全件成功後にだけ cursor と削除処理を更新します。
+投稿は X 投稿 ID を主キーに `INSERT OR IGNORE` で保存します。同じ Cron が重複実行されても、投稿と checkpoint は重複しません。投稿保存と各 source の checkpoint は同じ D1 batch で更新します。following のアカウント upsert と各ページの投稿保存はmulti-row SQLにまとめ、全件成功後にだけ cursor と削除処理を更新します。
 
 ## 用語
 

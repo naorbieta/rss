@@ -16,6 +16,55 @@ async function markFollowingAsCurrent(): Promise<void> {
   ]);
 }
 
+function countD1Queries(database: D1Database): { db: D1Database; queries: string[] } {
+  const queries: string[] = [];
+  const originals = new WeakMap<object, D1PreparedStatement>();
+  const sqlByStatement = new WeakMap<object, string>();
+  const wrap = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => {
+    const proxy = new Proxy(statement, {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver);
+        if (property === "bind" && typeof value === "function") {
+          return (...args: unknown[]) => wrap(Reflect.apply(value, target, args) as D1PreparedStatement, sql);
+        }
+        if (["run", "first", "all", "raw"].includes(String(property)) && typeof value === "function") {
+          return (...args: unknown[]) => {
+            queries.push(sql);
+            return Reflect.apply(value, target, args);
+          };
+        }
+        return value;
+      },
+    });
+    originals.set(proxy, statement);
+    sqlByStatement.set(proxy, sql);
+    sqlByStatement.set(statement, sql);
+    return proxy;
+  };
+  const db = new Proxy(database, {
+    get(target, property, receiver) {
+      if (property === "prepare") return (sql: string) => wrap(target.prepare(sql), sql);
+      if (property === "batch") return (statements: D1PreparedStatement[]) => {
+        const unwrapped = statements.map((statement) => originals.get(statement) ?? statement);
+        unwrapped.forEach((statement) => queries.push(sqlByStatement.get(statement) ?? ""));
+        return target.batch(unwrapped);
+      };
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  return { db, queries };
+}
+
+function statusFixture(prefix: string, count: number): Array<Record<string, unknown>> {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `${prefix}-${index}`,
+    url: `https://x.com/alice/status/${prefix}-${index}`,
+    text: `${prefix}-${index}`,
+    created_timestamp: 1_700_000_000 + index,
+    author: { id: "author", screen_name: "alice", name: "Alice" },
+  }));
+}
+
 beforeAll(async () => {
   await db.batch([
     db.prepare(`CREATE TABLE IF NOT EXISTS posts (
@@ -97,6 +146,7 @@ describe("FxEmbed collector", () => {
       const parsed = new URL(url);
       if (parsed.pathname === "/2/profile/alice/statuses") {
         expect(parsed.searchParams.get("since")).toBe("1699999900");
+        expect(parsed.searchParams.get("count")).toBe("6");
         expect(parsed.searchParams.get("with_replies")).toBeNull();
         return new Response(JSON.stringify({ code: 200, results: { timeline: [
           { id: "1", url: "https://x.com/alice/status/1", text: "投稿", created_timestamp: 1_700_000_000, author: { id: "a", screen_name: "alice", name: "Alice" } },
@@ -105,6 +155,7 @@ describe("FxEmbed collector", () => {
       }
       if (parsed.pathname === "/2/search") {
         expect(parsed.searchParams.get("feed")).toBe("latest");
+        expect(parsed.searchParams.get("count")).toBe("6");
         return new Response(JSON.stringify({ code: 200, results: { timeline: [
           { id: "1", url: "https://x.com/alice/status/1", text: "重複検索結果", created_timestamp: 1_700_000_000, author: { id: "a", screen_name: "alice", name: "Alice" } },
           { id: "3", url: "https://x.com/bob/status/3", text: "検索結果", created_timestamp: 1_700_000_002, author: { id: "b", screen_name: "bob", name: "Bob" }, quote: { id: "2", text: "引用" } },
@@ -126,13 +177,228 @@ describe("FxEmbed collector", () => {
     expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE query = ?").bind("cloudflare").first<{ last_checked_at: string }>())?.last_checked_at).toBe("2023-11-14T22:15:00.000Z");
   });
 
+  it("uses bounded multi-row statements for 20 following accounts and 6 posts", async () => {
+    const start = 1_700_000_100_000;
+    const counter = countD1Queries(db);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const parsed = new URL(String(input));
+      if (parsed.pathname === "/2/profile/source/following") {
+        expect(parsed.searchParams.get("count")).toBe("20");
+        return new Response(JSON.stringify({ results: { users: Array.from({ length: 20 }, (_, index) => ({
+          id: `following-${index}`, screen_name: `following-${index}`, name: `Following ${index}`,
+        })) }, cursor: { bottom: null } }));
+      }
+      if (parsed.pathname === "/2/profile/alice/statuses") {
+        expect(parsed.searchParams.get("count")).toBe("6");
+        return new Response(JSON.stringify({ results: { timeline: statusFixture("account", 6) }, cursor: { bottom: null } }));
+      }
+      throw new Error(`unexpected fetch: ${parsed.pathname}`);
+    });
+
+    await syncFollowingPage(counter.db, "source", start);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM accounts").first<{ count: number }>())?.count).toBe(20);
+    const accountStatements = counter.queries.filter((sql) => sql.includes("INSERT INTO accounts"));
+    expect(accountStatements).toHaveLength(1);
+    expect((accountStatements[0].match(/\?/g) ?? []).length).toBe(100);
+
+    await db.batch([
+      db.prepare("DELETE FROM accounts"),
+      db.prepare("DELETE FROM collector_state"),
+      db.prepare("DELETE FROM posts"),
+    ]);
+    await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind("a", "alice", "Alice").run();
+    await markFollowingAsCurrent();
+    counter.queries.length = 0;
+
+    await collectOnce({ DB: counter.db, SOURCE_HANDLE: "source" }, start);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(6);
+    const postStatements = counter.queries.filter((sql) => sql.includes("INSERT OR IGNORE INTO posts"));
+    expect(postStatements).toHaveLength(1);
+    expect((postStatements[0].match(/\?/g) ?? []).length).toBe(90);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not advance following state when the upstream exceeds count=20", async () => {
+    const previous = "2023-11-14T22:00:00.000Z";
+    await db.batch([
+      db.prepare("INSERT INTO accounts (id, handle, name, sync_marker) VALUES (?, ?, ?, ?)").bind("old", "old", "Old", "old-marker"),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_source_handle", "source", previous),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_cursor", "old-cursor", previous),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_marker", "old-marker", previous),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_sync_at", previous, previous),
+    ]);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const parsed = new URL(String(input));
+      expect(parsed.pathname).toBe("/2/profile/source/following");
+      expect(parsed.searchParams.get("count")).toBe("20");
+      expect(parsed.searchParams.get("cursor")).toBe("old-cursor");
+      return new Response(JSON.stringify({ results: { users: Array.from({ length: 21 }, (_, index) => ({
+        id: `too-many-${index}`, screen_name: `too-many-${index}`, name: `Too Many ${index}`,
+      })) }, cursor: { bottom: null } }));
+    });
+
+    expect(await collectOnce(accountRuntimeEnv, 1_700_000_100_000)).toEqual({ following: false, accounts: 0, queries: 0 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_cursor").first<{ value: string }>())?.value).toBe("old-cursor");
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_marker").first<{ value: string }>())?.value).toBe("old-marker");
+    expect((await db.prepare("SELECT handle FROM accounts").all<{ handle: string }>()).results).toEqual([{ handle: "old" }]);
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_pending_source_handle").first<{ value: string }>())?.value).toBe("source");
+  });
+
+  it("does not advance account state when statuses exceed count=6", async () => {
+    await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind("a", "alice", "Alice").run();
+    await markFollowingAsCurrent();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const parsed = new URL(String(input));
+      expect(parsed.pathname).toBe("/2/profile/alice/statuses");
+      expect(parsed.searchParams.get("count")).toBe("6");
+      return new Response(JSON.stringify({ results: { timeline: statusFixture("too-many-statuses", 7) }, cursor: { bottom: "unexpected" } }));
+    });
+
+    expect((await collectOnce(accountRuntimeEnv, 1_700_000_100_000)).accounts).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(0);
+    expect((await db.prepare("SELECT last_post_timestamp, last_checked_at FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number | null; last_checked_at: string | null }>())).toEqual({ last_post_timestamp: null, last_checked_at: null });
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("account_status:a").first<{ count: number }>())?.count).toBe(0);
+  });
+
+  it("does not advance search state when results exceed count=6", async () => {
+    await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("too-many-results").run();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const parsed = new URL(String(input));
+      expect(parsed.pathname).toBe("/2/search");
+      expect(parsed.searchParams.get("count")).toBe("6");
+      return new Response(JSON.stringify({ results: { timeline: statusFixture("too-many-results", 7) }, cursor: { bottom: "unexpected" } }));
+    });
+
+    expect((await collectOnce(runtimeEnv, 1_700_000_100_000)).queries).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(0);
+    expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE query = ?").bind("too-many-results").first<{ last_checked_at: string | null }>())?.last_checked_at).toBeNull();
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key LIKE ?").bind("search_query:%").first<{ count: number }>())?.count).toBe(0);
+  });
+
+  it("does not delete following accounts when the response cursor is missing", async () => {
+    const previous = "2023-11-14T22:00:00.000Z";
+    await db.batch([
+      db.prepare("INSERT INTO accounts (id, handle, name, sync_marker) VALUES (?, ?, ?, ?)").bind("old", "old", "Old", "old-marker"),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_source_handle", "source", previous),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_cursor", "old-cursor", previous),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_marker", "old-marker", previous),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_sync_at", previous, previous),
+    ]);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ results: { users: [] } })));
+
+    await expect(syncFollowingPage(db, "source", 1_700_000_100_000)).rejects.toThrow(/invalid cursor/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((await db.prepare("SELECT handle FROM accounts").all<{ handle: string }>()).results).toEqual([{ handle: "old" }]);
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_cursor").first<{ value: string }>())?.value).toBe("old-cursor");
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_marker").first<{ value: string }>())?.value).toBe("old-marker");
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_sync_at").first<{ value: string }>())?.value).toBe(previous);
+  });
+
+  it("does not checkpoint an account when the response cursor is missing", async () => {
+    await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind("a", "alice", "Alice").run();
+    await markFollowingAsCurrent();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ results: { timeline: statusFixture("missing-cursor", 1) } })));
+
+    expect((await collectOnce(accountRuntimeEnv, 1_700_000_100_000)).accounts).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(0);
+    expect((await db.prepare("SELECT last_checked_at FROM accounts WHERE id = ?").bind("a").first<{ last_checked_at: string | null }>())?.last_checked_at).toBeNull();
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("account_status:a").first<{ count: number }>())?.count).toBe(0);
+  });
+
+  it("does not checkpoint a search query when the response cursor is missing", async () => {
+    await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("missing-cursor-query").run();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ results: { timeline: statusFixture("missing-search-cursor", 1) } })));
+
+    expect((await collectOnce(runtimeEnv, 1_700_000_100_000)).queries).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(0);
+    expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE query = ?").bind("missing-cursor-query").first<{ last_checked_at: string | null }>())?.last_checked_at).toBeNull();
+  });
+
+  it("keeps the worst no-following run within 50 D1 queries", async () => {
+    for (let index = 0; index < 3; index += 1) {
+      await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind(`account-${index}`, `account-${index}`, `Account ${index}`).run();
+    }
+    for (let index = 1; index <= 6; index += 1) {
+      await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind(`q${index}`).run();
+    }
+    await markFollowingAsCurrent();
+    await db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("search_scan_position", "4", "2999-01-01T00:00:00.000Z").run();
+    const counter = countD1Queries(db);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const parsed = new URL(String(input));
+      if (parsed.pathname.endsWith("/statuses")) {
+        expect(parsed.searchParams.get("count")).toBe("6");
+        return new Response(JSON.stringify({ results: { timeline: statusFixture(parsed.pathname.split("/").at(-2) ?? "account", 6) }, cursor: { bottom: null } }));
+      }
+      if (parsed.pathname === "/2/search") {
+        expect(parsed.searchParams.get("count")).toBe("6");
+        return new Response(JSON.stringify({ results: { timeline: statusFixture(parsed.searchParams.get("q") ?? "query", 6) }, cursor: { bottom: null } }));
+      }
+      throw new Error(`unexpected fetch: ${parsed.pathname}`);
+    });
+
+    const result = await collectOnce({ DB: counter.db, SOURCE_HANDLE: "source" }, 1_700_000_100_000);
+    expect(result).toEqual({ following: false, accounts: 3, queries: 5 });
+    expect(counter.queries.length).toBe(49);
+    expect(counter.queries.length).toBeLessThanOrEqual(50);
+    expect(fetchMock).toHaveBeenCalledTimes(8);
+  });
+
+  it("keeps a following final page and five searches within 50 D1 queries", async () => {
+    const start = 1_700_000_100_000;
+    const previousSync = new Date(start - 25 * 60 * 60 * 1000).toISOString();
+    await db.batch([
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_source_handle", "source", previousSync),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_cursor", "", previousSync),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_marker", "", previousSync),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_sync_at", previousSync, previousSync),
+    ]);
+    for (let index = 1; index <= 6; index += 1) {
+      await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind(`q${index}`).run();
+    }
+    await db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("search_scan_position", "4", previousSync).run();
+    const counter = countD1Queries(db);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const parsed = new URL(String(input));
+      if (parsed.pathname === "/2/profile/source/following") {
+        expect(parsed.searchParams.get("count")).toBe("20");
+        return new Response(JSON.stringify({ results: { users: Array.from({ length: 20 }, (_, index) => ({
+          id: `following-${index}`, screen_name: `following-${index}`, name: `Following ${index}`,
+        })) }, cursor: { bottom: null } }));
+      }
+      if (parsed.pathname === "/2/search") {
+        expect(parsed.searchParams.get("count")).toBe("6");
+        return new Response(JSON.stringify({ results: { timeline: statusFixture(parsed.searchParams.get("q") ?? "query", 6) }, cursor: { bottom: null } }));
+      }
+      throw new Error(`unexpected fetch: ${parsed.pathname}`);
+    });
+
+    const result = await collectOnce({ DB: counter.db, SOURCE_HANDLE: "source" }, start);
+    expect(result).toEqual({ following: true, accounts: 0, queries: 5 });
+    expect(counter.queries.length).toBe(44);
+    expect(counter.queries.length).toBeLessThanOrEqual(50);
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
+      "/2/profile/source/following",
+      "/2/search",
+      "/2/search",
+      "/2/search",
+      "/2/search",
+      "/2/search",
+    ]);
+  });
+
   it("keeps old following accounts until the final cursor page succeeds", async () => {
     await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind("old", "old", "Old").run();
     const fetchMock = vi.spyOn(globalThis, "fetch");
     fetchMock.mockImplementationOnce(async (input) => {
       const parsed = new URL(String(input));
       expect(parsed.pathname).toBe("/2/profile/source/following");
-      expect(parsed.searchParams.get("count")).toBe("100");
+      expect(parsed.searchParams.get("count")).toBe("20");
       expect(parsed.searchParams.get("cursor")).toBeNull();
       return new Response(JSON.stringify({ results: { users: [{ id: "a", screen_name: "alice", name: "Alice" }] }, cursor: { bottom: "next" } }));
     });
@@ -221,6 +487,96 @@ describe("FxEmbed collector", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it("stops status polling during a same-source refresh until its final page", async () => {
+    const start = 1_700_000_100_000;
+    const previousSync = new Date(start - 25 * 60 * 60 * 1000).toISOString();
+    await db.batch([
+      db.prepare("INSERT INTO accounts (id, handle, name, sync_marker) VALUES (?, ?, ?, ?)").bind("old", "old", "Old", "old-marker"),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_source_handle", "source", previousSync),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_cursor", "", previousSync),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_marker", "", previousSync),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_sync_at", previousSync, previousSync),
+    ]);
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { users: [{ id: "new", screen_name: "new-account", name: "New" }] }, cursor: { bottom: "next" } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { users: [{ id: "new", screen_name: "new-account", name: "New" }] }, cursor: { bottom: null } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } })));
+
+    expect((await collectOnce(accountRuntimeEnv, start)).accounts).toBe(0);
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual(["/2/profile/source/following"]);
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_pending_source_handle").first<{ value: string }>())?.value).toBe("source");
+
+    expect((await collectOnce(accountRuntimeEnv, start + 15 * 60 * 1000)).accounts).toBe(0);
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
+      "/2/profile/source/following",
+      "/2/profile/source/following",
+    ]);
+
+    expect((await collectOnce(accountRuntimeEnv, start + 30 * 60 * 1000)).accounts).toBe(1);
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
+      "/2/profile/source/following",
+      "/2/profile/source/following",
+      "/2/profile/new-account/statuses",
+    ]);
+    expect((await db.prepare("SELECT handle FROM accounts ORDER BY handle").all<{ handle: string }>()).results).toEqual([{ handle: "new-account" }]);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("following_pending_source_handle").first<{ count: number }>())?.count).toBe(0);
+  });
+
+  it("keeps status polling stopped when a same-source refresh fetch fails", async () => {
+    const start = 1_700_000_100_000;
+    const previousSync = new Date(start - 25 * 60 * 60 * 1000).toISOString();
+    await db.batch([
+      db.prepare("INSERT INTO accounts (id, handle, name, sync_marker) VALUES (?, ?, ?, ?)").bind("old", "old", "Old", "old-marker"),
+      db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("still-searches"),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_source_handle", "source", previousSync),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_cursor", "", previousSync),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_marker", "", previousSync),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_sync_at", previousSync, previousSync),
+    ]);
+    let followingCalls = 0;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const parsed = new URL(String(input));
+      if (parsed.pathname === "/2/profile/source/following") {
+        followingCalls += 1;
+        if (followingCalls === 1) return new Response(JSON.stringify({ error: "failed" }), { status: 500 });
+        return new Response(JSON.stringify({ results: { users: [{ id: "new", screen_name: "new-account", name: "New" }] }, cursor: { bottom: null } }));
+      }
+      if (parsed.pathname === "/2/profile/new-account/statuses") {
+        return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } }));
+      }
+      if (parsed.pathname === "/2/search") {
+        return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } }));
+      }
+      throw new Error(`unexpected fetch: ${parsed.pathname}`);
+    });
+
+    expect(await collectOnce(accountRuntimeEnv, start)).toEqual({ following: false, accounts: 0, queries: 1 });
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
+      "/2/profile/source/following",
+      "/2/search",
+    ]);
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_pending_source_handle").first<{ value: string }>())?.value).toBe("source");
+
+    expect(await collectOnce(accountRuntimeEnv, start + 15 * 60 * 1000)).toEqual({ following: true, accounts: 0, queries: 1 });
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
+      "/2/profile/source/following",
+      "/2/search",
+      "/2/profile/source/following",
+      "/2/search",
+    ]);
+    expect(await collectOnce(accountRuntimeEnv, start + 30 * 60 * 1000)).toEqual({ following: false, accounts: 1, queries: 1 });
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
+      "/2/profile/source/following",
+      "/2/search",
+      "/2/profile/source/following",
+      "/2/search",
+      "/2/profile/new-account/statuses",
+      "/2/search",
+    ]);
+    expect((await db.prepare("SELECT handle FROM accounts ORDER BY handle").all<{ handle: string }>()).results).toEqual([{ handle: "new-account" }]);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("following_pending_source_handle").first<{ count: number }>())?.count).toBe(0);
+  });
+
   it("updates a following account by stable id when its handle changes", async () => {
     await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind("a", "oldname", "Old").run();
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ results: { users: [{ id: "a", screen_name: "newname", name: "New" }] }, cursor: { bottom: null } })));
@@ -272,7 +628,14 @@ describe("FxEmbed collector", () => {
     expect((await collectOnce(newRuntimeEnv, 1_700_000_101_000)).accounts).toBe(0);
     expect((await db.prepare("SELECT COUNT(*) AS count FROM accounts").first<{ count: number }>())?.count).toBe(1);
     const completed = await collectOnce(newRuntimeEnv, 1_700_000_102_000);
-    expect(completed.accounts).toBe(1);
+    expect(completed.accounts).toBe(0);
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
+      "/2/profile/new-source/following",
+      "/2/profile/new-source/following",
+      "/2/profile/new-source/following",
+    ]);
+    const resumed = await collectOnce(newRuntimeEnv, 1_700_000_103_000);
+    expect(resumed.accounts).toBe(1);
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
       "/2/profile/new-source/following",
       "/2/profile/new-source/following",
@@ -295,7 +658,7 @@ describe("FxEmbed collector", () => {
   });
 
   it("advances the batch position after a failed account and retries it next cycle", async () => {
-    for (let index = 0; index < 21; index += 1) {
+    for (let index = 0; index < 4; index += 1) {
       const handle = `h${String(index).padStart(2, "0")}`;
       await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind(handle, handle, handle).run();
     }
@@ -307,10 +670,10 @@ describe("FxEmbed collector", () => {
     });
 
     await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
-    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_scan_position").first<{ value: string }>())?.value).toBe("20");
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_scan_position").first<{ value: string }>())?.value).toBe("3");
     fetchMock.mockClear();
     await collectOnce(accountRuntimeEnv, 1_700_000_101_000);
-    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toContain("/2/profile/h20/statuses");
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toContain("/2/profile/h03/statuses");
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toContain("/2/profile/h00/statuses");
   });
 
@@ -461,9 +824,14 @@ describe("FxEmbed collector", () => {
     await followingStarted;
     expect(await collectOnce(accountRuntimeEnv, start)).toEqual({ following: false, accounts: 0, queries: 0 });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    const leaseReadAt = Date.now();
+    const lease = await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("collection_lease").first<{ value: string }>();
+    const leaseExpiresAt = Number(lease?.value.split(":", 1)[0]);
+    expect(leaseExpiresAt).toBeGreaterThan(leaseReadAt + 8 * 60 * 1000);
+    expect(leaseExpiresAt).toBeLessThan(leaseReadAt + 12 * 60 * 1000);
 
     releaseFollowing();
-    expect(await firstRun).toEqual({ following: true, accounts: 1, queries: 0 });
+    expect(await firstRun).toEqual({ following: true, accounts: 0, queries: 0 });
     expect((await db.prepare("SELECT COUNT(*) AS count FROM accounts").first<{ count: number }>())?.count).toBe(1);
     expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("collection_lease").first<{ count: number }>())?.count).toBe(0);
 

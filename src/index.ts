@@ -69,11 +69,13 @@ type RuntimeEnv = WorkerEnv;
 
 const API_BASE = "https://api.fxtwitter.com";
 const FETCH_TIMEOUT_MS = 10_000;
-const MAX_ACCOUNTS_PER_RUN = 20;
+const FOLLOWING_API_COUNT = 20;
+const STATUS_API_COUNT = 6;
+const SEARCH_API_COUNT = 6;
+const MAX_ACCOUNTS_PER_RUN = 3;
 const MAX_QUERIES_PER_RUN = 5;
-const MAX_FOLLOWING_UPSERTS_PER_BATCH = 50;
 const FOLLOWING_RESYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
-// 26 upstream requests × 10 seconds fits within this lease; it remains below the 15-minute Cron interval.
+// No-following runs make at most 8 upstream requests (3 accounts + 5 queries), so 80 seconds at timeout; the 10-minute lease is ample and below the 15-minute Cron interval.
 const COLLECTION_LEASE_MS = 10 * 60 * 1000;
 const ACCOUNT_STATUS_STATE_PREFIX = "account_status:";
 const SEARCH_QUERY_STATE_PREFIX = "search_query:";
@@ -174,9 +176,18 @@ function findArray(value: unknown, names: string[], depth = 0): unknown[] | null
 }
 
 function responseCursor(value: unknown): string | null {
-  if (!isRecord(value)) return null;
-  const cursor = isRecord(value.cursor) ? value.cursor : null;
-  return asString(cursor?.bottom ?? cursor?.next);
+  if (!isRecord(value) || !isRecord(value.cursor)) throw new Error("upstream payload has an invalid cursor");
+  const cursor = value.cursor;
+  const key = Object.prototype.hasOwnProperty.call(cursor, "bottom")
+    ? "bottom"
+    : Object.prototype.hasOwnProperty.call(cursor, "next")
+      ? "next"
+      : null;
+  if (!key) throw new Error("upstream payload has an invalid cursor");
+  const next = cursor[key];
+  if (next === null) return null;
+  if (typeof next !== "string" || !next.trim()) throw new Error("upstream payload has an invalid cursor");
+  return next.trim();
 }
 
 type FetchOptions = { allowNoContent?: boolean; allowNotFoundEmpty?: boolean };
@@ -211,7 +222,9 @@ async function fetchApi(url: string, source: string, options: FetchOptions = {})
     throw new Error(`${source}: invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (!response.ok) {
-    if (options.allowNotFoundEmpty && response.status === 404 && isRecord(body) && asNumber(body.code, NaN) === 404 && isEmptyResult(body)) return body;
+    if (options.allowNotFoundEmpty && response.status === 404 && isRecord(body) && asNumber(body.code, NaN) === 404 && isEmptyResult(body)) {
+      return { ...body, cursor: { bottom: null } };
+    }
     throw new Error(`${source}: HTTP ${response.status}`);
   }
   if (isRecord(body) && typeof body.code === "number" && body.code >= 400) {
@@ -289,29 +302,41 @@ async function readSearchQueryCheckpoint(db: D1Database, query: DbQuery): Promis
   }
 }
 
-function postStatement(db: D1Database, post: ApiStatus, sourceKind: "following" | "search", sourceKey: string, collectedAt: string): D1PreparedStatement {
+function postsStatement(
+  db: D1Database,
+  posts: ApiStatus[],
+  sourceKind: "following" | "search",
+  sourceKey: string,
+  collectedAt: string,
+): D1PreparedStatement | null {
+  if (!posts.length) return null;
+  const values: Array<string | number | null> = [];
+  const rows = posts.map((post) => {
+    values.push(
+      post.id,
+      post.url,
+      post.text,
+      post.createdTimestamp,
+      post.likes,
+      post.reposts,
+      post.quotes,
+      post.replies,
+      post.author.id,
+      post.author.screenName,
+      post.author.name,
+      post.quote ? JSON.stringify(post.quote) : null,
+      sourceKind,
+      sourceKey,
+      collectedAt,
+    );
+    return "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+  }).join(", ");
   return db.prepare(`
     INSERT OR IGNORE INTO posts
       (id, url, text, created_timestamp, likes, reposts, quotes, replies,
        author_id, author_screen_name, author_name, quote_json, source_kind, source_key, collected_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(
-    post.id,
-    post.url,
-    post.text,
-    post.createdTimestamp,
-    post.likes,
-    post.reposts,
-    post.quotes,
-    post.replies,
-    post.author.id,
-    post.author.screenName,
-    post.author.name,
-    post.quote ? JSON.stringify(post.quote) : null,
-    sourceKind,
-    sourceKey,
-    collectedAt,
-  );
+    VALUES ${rows}
+  `).bind(...values);
 }
 
 async function saveAccountPosts(
@@ -326,7 +351,9 @@ async function saveAccountPosts(
     (max, post) => Math.max(max, post.createdTimestamp),
     Math.max(account.last_post_timestamp ?? 0, checkpoint?.latest ?? 0),
   );
-  const statements = page.statuses.filter((post) => !post.isReply).map((post) => postStatement(db, post, "following", account.handle, checkedAt));
+  const statements: D1PreparedStatement[] = [];
+  const posts = postsStatement(db, page.statuses.filter((post) => !post.isReply), "following", account.handle, checkedAt);
+  if (posts) statements.push(posts);
   const stateKey = accountStatusStateKey(account.id);
   if (page.cursor) {
     statements.push(db.prepare("UPDATE accounts SET last_checked_at = ? WHERE id = ?").bind(checkedAt, account.id));
@@ -349,7 +376,9 @@ async function saveQueryPosts(
   page: { statuses: ApiStatus[]; cursor: string | null },
   checkedAt: string,
 ): Promise<void> {
-  const statements = page.statuses.map((post) => postStatement(db, post, "search", query.query, checkedAt));
+  const statements: D1PreparedStatement[] = [];
+  const posts = postsStatement(db, page.statuses, "search", query.query, checkedAt);
+  if (posts) statements.push(posts);
   const stateKey = searchQueryStateKey(query.id);
   if (page.cursor) {
     statements.push(stateStatement(db, stateKey, JSON.stringify({ query: query.query, cursor: page.cursor }), checkedAt));
@@ -365,25 +394,27 @@ export async function syncFollowingPage(db: D1Database, sourceHandle: string, no
   const sameSource = savedSourceHandle === sourceHandle;
   const currentCursor = sameSource ? await readState(db, "following_cursor") : null;
   const marker = (sameSource ? await readState(db, "following_marker") : null) || crypto.randomUUID();
-  const query = new URLSearchParams({ count: "100" });
+  const query = new URLSearchParams({ count: String(FOLLOWING_API_COUNT) });
   if (currentCursor) query.set("cursor", currentCursor);
+  const updatedAt = new Date(nowMs).toISOString();
+  await db.batch([stateStatement(db, FOLLOWING_PENDING_SOURCE_KEY, sourceHandle, updatedAt)]);
   const body = await fetchApi(`${API_BASE}/2/profile/${encodeURIComponent(sourceHandle)}/following?${query}`, "following");
   const page = normalizeFollowingPage(body);
-  const updatedAt = new Date(nowMs).toISOString();
-  const accountStatements = page.accounts.map((account) => db.prepare(`
-    INSERT INTO accounts (id, handle, name, protected, sync_marker) VALUES (?, ?, ?, ?, ?)
+  if (page.accounts.length > FOLLOWING_API_COUNT) throw new Error(`following: upstream returned more than ${FOLLOWING_API_COUNT} accounts`);
+  const accountValues: Array<string | number> = [];
+  const accountRows = page.accounts.map((account) => {
+    accountValues.push(account.id, account.handle, account.name, account.protected ? 1 : 0, marker);
+    return "(?, ?, ?, ?, ?)";
+  }).join(", ");
+  if (accountRows) await db.batch([db.prepare(`
+    INSERT INTO accounts (id, handle, name, protected, sync_marker) VALUES ${accountRows}
     ON CONFLICT(id) DO UPDATE SET handle = excluded.handle, name = excluded.name,
       protected = excluded.protected, sync_marker = excluded.sync_marker
-  `).bind(account.id, account.handle, account.name, account.protected ? 1 : 0, marker));
-
-  for (let offset = 0; offset < accountStatements.length; offset += MAX_FOLLOWING_UPSERTS_PER_BATCH) {
-    await db.batch(accountStatements.slice(offset, offset + MAX_FOLLOWING_UPSERTS_PER_BATCH));
-  }
+  `).bind(...accountValues)]);
 
   const stateStatements: D1PreparedStatement[] = [];
   if (page.cursor) {
     stateStatements.push(stateStatement(db, "following_source_handle", sourceHandle, updatedAt));
-    if (!sameSource) stateStatements.push(stateStatement(db, FOLLOWING_PENDING_SOURCE_KEY, sourceHandle, updatedAt));
     stateStatements.push(stateStatement(db, "following_cursor", page.cursor, updatedAt));
     stateStatements.push(stateStatement(db, "following_marker", marker, updatedAt));
   } else {
@@ -428,6 +459,7 @@ async function collectAccountStatuses(db: D1Database, nowMs: number): Promise<nu
     try {
       const checkpoint = await readAccountStatusCheckpoint(db, account.id);
       const query = new URLSearchParams();
+      query.set("count", String(STATUS_API_COUNT));
       if (checkpoint?.cursor) query.set("cursor", checkpoint.cursor);
       const since = checkpoint ? checkpoint.since : account.last_post_timestamp;
       if (since) query.set("since", String(since));
@@ -438,6 +470,7 @@ async function collectAccountStatuses(db: D1Database, nowMs: number): Promise<nu
         { allowNoContent: !checkpoint?.cursor },
       );
       const page = normalizeStatusPage(body);
+      if (page.statuses.length > STATUS_API_COUNT) throw new Error(`account:${account.handle}: upstream returned more than ${STATUS_API_COUNT} statuses`);
       await saveAccountPosts(db, account, checkpoint, page, since, checkedAt);
     } catch (error) {
       logSourceFailure(`account:${account.handle}`, error);
@@ -477,10 +510,11 @@ async function collectSearchQueries(db: D1Database, nowMs: number): Promise<numb
   for (const query of selected) {
     try {
       const checkpoint = await readSearchQueryCheckpoint(db, query);
-      const params = new URLSearchParams({ q: query.query, feed: "latest" });
+      const params = new URLSearchParams({ q: query.query, feed: "latest", count: String(SEARCH_API_COUNT) });
       if (checkpoint?.cursor) params.set("cursor", checkpoint.cursor);
       const body = await fetchApi(`${API_BASE}/2/search?${params}`, `query:${query.query}`, { allowNotFoundEmpty: true });
       const page = normalizeStatusPage(body);
+      if (page.statuses.length > SEARCH_API_COUNT) throw new Error(`query:${query.query}: upstream returned more than ${SEARCH_API_COUNT} statuses`);
       await saveQueryPosts(db, query, { ...page, statuses: page.statuses.filter((post) => !post.isReply) }, checkedAt);
     } catch (error) {
       logSourceFailure(`query:${query.query}`, error);
@@ -532,13 +566,15 @@ async function releaseCollectionLease(db: D1Database, value: string): Promise<vo
 }
 
 export async function collectOnce(env: RuntimeEnv, nowMs = Date.now()): Promise<{ following: boolean; accounts: number; queries: number }> {
-  const leaseValue = await claimCollectionLease(env.DB, nowMs);
+  const leaseValue = await claimCollectionLease(env.DB, Date.now());
   if (!leaseValue) return { following: false, accounts: 0, queries: 0 };
 
   try {
     const sourceHandle = env.SOURCE_HANDLE.trim();
     let following = false;
+    let followingRun = false;
     if (sourceHandle && await shouldSyncFollowing(env.DB, sourceHandle, nowMs)) {
+      followingRun = true;
       try {
         await syncFollowingPage(env.DB, sourceHandle, nowMs);
         following = true;
@@ -548,7 +584,7 @@ export async function collectOnce(env: RuntimeEnv, nowMs = Date.now()): Promise<
     }
 
     let accounts = 0;
-    if (sourceHandle && await canCollectAccountStatuses(env.DB, sourceHandle)) {
+    if (sourceHandle && !followingRun && await canCollectAccountStatuses(env.DB, sourceHandle)) {
       try {
         accounts = await collectAccountStatuses(env.DB, nowMs);
       } catch (error) {
