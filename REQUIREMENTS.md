@@ -8,7 +8,7 @@
 | 2. 保存済みアカウントを since 収集、返信を除外 | `collectAccountStatuses`、`normalizeStatus` | `since`、`with_replies` 未指定、返信除外、204成功と時刻更新、`retweets`→`reposts`、fresh先行・固定sinceのstatus cursor、queued cursorの切替、初回履歴抑止、同秒IDを含むidle watermark、失敗時保持を確認 |
 | 3. enabled query を latest 収集 | `collectSearchQueries`、`saveSearchLatest`、`saveSearchBacklog` | cursorなしの latest と backlog cursor を毎回別取得、空404成功、検索語ごとの cursor 継続・query変更時リセット、backlog中の新着 cursor を `queued_cursor` に保持して切替、latest 成功時の `last_checked_at`、stop watermarkと同秒IDの境界での backlog 終了、成功可否に依存しない巡回位置を確認 |
 | 4. 投稿 ID 主キー、quote 保存 | migration の `posts.id`、`postsStatement` | following/searchの同一ID 1件保存、`quote_json` を確認 |
-| 5. Cron、checkpoint、実行上限 | `scheduled`、`collectOnce`、`collector_state` | Cron、scheduled handler、24時間再同期、SOURCE_HANDLE変更時・24時間再同期の再開とfull sync完了前status停止、空SOURCE_HANDLE時のstatus停止、status/query の巡回、失敗batchの巡回、following=20・status/search=6の上流count検証、accounts=2・queries=3、収集全体の期限付きリースによる重複実行の直列化と期限復帰、D1 Free 50クエリ内（最大49、following実行回43）の実D1計測、typecheck、Vitest |
+| 5. Cron、checkpoint、実行上限 | `scheduled`、`collectOnce`、`collector_state` | Cron、scheduled handler、24時間再同期、SOURCE_HANDLE変更時・24時間再同期の再開とfull sync完了前status停止、空SOURCE_HANDLE時のstatus停止、status/query の巡回、失敗batchの巡回、following=20・status/search=6の上流count検証、accounts=2・queries=3、収集全体の期限付きリースによる重複実行の直列化と期限復帰、D1 Free 50クエリ内（最大49、following実行回42）の実D1計測、typecheck、Vitest |
 | 6. `/feed` の pagination・hours・ISO・降順 | `feed` | `generated_at` / `posts`、ページング、hours、`created_at`、ID同率順、quote、不正paginationを確認 |
 | 7. ChatGPT 向け安定 JSON | `feed` の `generated_at` / `posts` envelope | Worker fetch の JSON テスト、README の payload 例 |
 | 8. 推薦ロジックを入れない | `src/index.ts` に推薦処理なし | README の責務境界 |

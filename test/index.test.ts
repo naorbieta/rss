@@ -397,7 +397,7 @@ describe("FxEmbed collector", () => {
 
     const result = await collectOnce({ DB: counter.db, SOURCE_HANDLE: "source" }, start);
     expect(result).toEqual({ following: true, accounts: 0, queries: 3 });
-    expect(counter.queries.length).toBe(43);
+    expect(counter.queries.length).toBe(42);
     expect(counter.queries.length).toBeLessThanOrEqual(50);
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
       "/2/profile/source/following",
@@ -617,6 +617,40 @@ describe("FxEmbed collector", () => {
     expect((await collectOnce({ DB: db, SOURCE_HANDLE: "source" }, start + 2 * 60 * 60 * 1000)).following).toBe(false);
     expect((await collectOnce({ DB: db, SOURCE_HANDLE: "source" }, start + 25 * 60 * 60 * 1000)).following).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the account scan position after same-source full sync completion", async () => {
+    const start = 1_700_000_100_000;
+    const previousSync = new Date(start - 25 * 60 * 60 * 1000).toISOString();
+    await db.batch([
+      ...Array.from({ length: 5 }, (_, index) => db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind(`a${index}`, `h${String(index).padStart(2, "0")}`, `H${index}`)),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_source_handle", "source", previousSync),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_cursor", "", previousSync),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_marker", "", previousSync),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_sync_at", previousSync, previousSync),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_scan_position", "3", previousSync),
+    ]);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const parsed = new URL(String(input));
+      if (parsed.pathname === "/2/profile/source/following") {
+        return new Response(JSON.stringify({ results: { users: Array.from({ length: 5 }, (_, index) => ({
+          id: `a${index}`, screen_name: `h${String(index).padStart(2, "0")}`, name: `H${index}`,
+        })) }, cursor: { bottom: null } }));
+      }
+      if (parsed.pathname.endsWith("/statuses")) {
+        return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } }));
+      }
+      throw new Error(`unexpected fetch: ${parsed.pathname}`);
+    });
+
+    expect((await collectOnce(accountRuntimeEnv, start)).following).toBe(true);
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_scan_position").first<{ value: string }>())?.value).toBe("3");
+    expect((await collectOnce(accountRuntimeEnv, start + 15 * 60 * 1000)).accounts).toBe(2);
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
+      "/2/profile/source/following",
+      "/2/profile/h03/statuses",
+      "/2/profile/h04/statuses",
+    ]);
   });
 
   it("stops status polling during a same-source refresh until its final page", async () => {

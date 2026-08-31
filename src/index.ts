@@ -703,7 +703,6 @@ export async function syncFollowingPage(db: D1Database, sourceHandle: string, no
     stateStatements.push(stateStatement(db, "following_cursor", "", updatedAt));
     stateStatements.push(stateStatement(db, "following_marker", "", updatedAt));
     stateStatements.push(stateStatement(db, "following_sync_at", updatedAt, updatedAt));
-    stateStatements.push(stateStatement(db, "following_scan_position", "0", updatedAt));
   }
   await db.batch(stateStatements);
   return { complete: !page.cursor, count: page.accounts.length };
