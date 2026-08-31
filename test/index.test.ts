@@ -135,7 +135,7 @@ describe("FxEmbed collector", () => {
     expect(status?.reposts).toBe(7);
   });
 
-  it("collects accounts and queries, excludes replies, and checkpoints each source", async () => {
+  it("excludes account replies but keeps search replies and checkpoints each source", async () => {
     await db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("a", "alice", "Alice", 1_699_999_900).run();
     await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("cloudflare").run();
     await markFollowingAsCurrent();
@@ -159,6 +159,7 @@ describe("FxEmbed collector", () => {
         return new Response(JSON.stringify({ code: 200, results: { timeline: [
           { id: "1", url: "https://x.com/alice/status/1", text: "重複検索結果", created_timestamp: 1_700_000_000, author: { id: "a", screen_name: "alice", name: "Alice" } },
           { id: "3", url: "https://x.com/bob/status/3", text: "検索結果", created_timestamp: 1_700_000_002, author: { id: "b", screen_name: "bob", name: "Bob" }, quote: { id: "2", text: "引用" } },
+          { id: "4", url: "https://x.com/bob/status/4", text: "検索返信", created_timestamp: 1_700_000_003, replying_to: "3", author: { id: "b", screen_name: "bob", name: "Bob" } },
         ] }, cursor: { bottom: null } }));
       }
       return new Response("not found", { status: 404 });
@@ -169,8 +170,10 @@ describe("FxEmbed collector", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
 
     const posts = await db.prepare("SELECT id, quote_json FROM posts ORDER BY id").all<{ id: string; quote_json: string | null }>();
-    expect(posts.results.map((post) => post.id)).toEqual(["1", "3"]);
+    expect(posts.results.map((post) => post.id)).toEqual(["1", "3", "4"]);
     expect((await db.prepare("SELECT COUNT(*) AS count FROM posts WHERE id = ?").bind("1").first<{ count: number }>())?.count).toBe(1);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts WHERE id = ?").bind("2").first<{ count: number }>())?.count).toBe(0);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts WHERE id = ?").bind("4").first<{ count: number }>())?.count).toBe(1);
     expect(JSON.parse(posts.results[1].quote_json ?? "null")).toEqual({ id: "2", text: "引用" });
     expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("a").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(1_700_000_001);
     expect((await db.prepare("SELECT last_checked_at FROM accounts WHERE id = ?").bind("a").first<{ last_checked_at: string }>())?.last_checked_at).toBe("2023-11-14T22:15:00.000Z");

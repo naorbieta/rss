@@ -515,7 +515,7 @@ async function collectSearchQueries(db: D1Database, nowMs: number): Promise<numb
       const body = await fetchApi(`${API_BASE}/2/search?${params}`, `query:${query.query}`, { allowNotFoundEmpty: true });
       const page = normalizeStatusPage(body);
       if (page.statuses.length > SEARCH_API_COUNT) throw new Error(`query:${query.query}: upstream returned more than ${SEARCH_API_COUNT} statuses`);
-      await saveQueryPosts(db, query, { ...page, statuses: page.statuses.filter((post) => !post.isReply) }, checkedAt);
+      await saveQueryPosts(db, query, page, checkedAt);
     } catch (error) {
       logSourceFailure(`query:${query.query}`, error);
     }
