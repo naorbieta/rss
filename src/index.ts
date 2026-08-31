@@ -38,7 +38,9 @@ type AccountStatusCheckpoint = {
 
 type SearchQueryCheckpoint = {
   query: string;
-  cursor: string;
+  backlogCursor: string | null;
+  stopWatermark: number | null;
+  pendingLatest: number | null;
 };
 
 type DbQuery = {
@@ -73,9 +75,9 @@ const FOLLOWING_API_COUNT = 20;
 const STATUS_API_COUNT = 6;
 const SEARCH_API_COUNT = 6;
 const MAX_ACCOUNTS_PER_RUN = 3;
-const MAX_QUERIES_PER_RUN = 5;
+const MAX_QUERIES_PER_RUN = 3;
 const FOLLOWING_RESYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
-// No-following runs make at most 8 upstream requests (3 accounts + 5 queries), so 80 seconds at timeout; the 10-minute lease is ample and below the 15-minute Cron interval.
+// No-following runs make at most 9 upstream requests (3 accounts + 3 queries × fresh/backlog), so 90 seconds at timeout; the 10-minute lease is ample and below the 15-minute Cron interval.
 const COLLECTION_LEASE_MS = 10 * 60 * 1000;
 const ACCOUNT_STATUS_STATE_PREFIX = "account_status:";
 const SEARCH_QUERY_STATE_PREFIX = "search_query:";
@@ -295,8 +297,17 @@ async function readSearchQueryCheckpoint(db: D1Database, query: DbQuery): Promis
   try {
     const parsed: unknown = JSON.parse(value);
     if (!isRecord(parsed) || parsed.query !== query.query) return null;
-    const cursor = asString(parsed.cursor);
-    return cursor ? { query: query.query, cursor } : null;
+    const rawCursor = Object.prototype.hasOwnProperty.call(parsed, "backlog_cursor") ? parsed.backlog_cursor : parsed.cursor;
+    const backlogCursor = rawCursor === undefined || rawCursor === null ? null : asString(rawCursor);
+    if (rawCursor !== undefined && rawCursor !== null && !backlogCursor) return null;
+    const stopValue = parsed.stop_watermark;
+    const pendingValue = parsed.pending_latest;
+    return {
+      query: query.query,
+      backlogCursor,
+      stopWatermark: stopValue === undefined || stopValue === null ? null : asTimestamp(stopValue),
+      pendingLatest: pendingValue === undefined || pendingValue === null ? null : asTimestamp(pendingValue),
+    };
   } catch {
     return null;
   }
@@ -370,22 +381,81 @@ async function saveAccountPosts(
   await db.batch(statements);
 }
 
-async function saveQueryPosts(
+function searchCheckpointValue(query: DbQuery, checkpoint: SearchQueryCheckpoint): string {
+  return JSON.stringify({
+    query: query.query,
+    backlog_cursor: checkpoint.backlogCursor,
+    stop_watermark: checkpoint.stopWatermark,
+    pending_latest: checkpoint.pendingLatest,
+  });
+}
+
+function newestStatusTimestamp(posts: ApiStatus[]): number | null {
+  const latest = posts.reduce((max, post) => Math.max(max, post.createdTimestamp), 0);
+  return latest || null;
+}
+
+function oldestStatusTimestamp(posts: ApiStatus[]): number | null {
+  const oldest = posts.reduce((min, post) => Math.min(min, post.createdTimestamp), Number.MAX_SAFE_INTEGER);
+  return oldest === Number.MAX_SAFE_INTEGER ? null : oldest;
+}
+
+async function saveSearchLatest(
   db: D1Database,
   query: DbQuery,
+  checkpoint: SearchQueryCheckpoint | null,
   page: { statuses: ApiStatus[]; cursor: string | null },
   checkedAt: string,
-): Promise<void> {
+): Promise<SearchQueryCheckpoint> {
+  const latest = newestStatusTimestamp(page.statuses);
+  let next: SearchQueryCheckpoint = checkpoint ?? {
+    query: query.query,
+    backlogCursor: null,
+    stopWatermark: latest,
+    pendingLatest: null,
+  };
+  if (checkpoint) {
+    const pendingLatest = Math.max(checkpoint.pendingLatest ?? 0, latest ?? 0) || null;
+    if (checkpoint.backlogCursor) {
+      next = { ...checkpoint, pendingLatest };
+    } else if (latest !== null && checkpoint.stopWatermark !== null && latest > checkpoint.stopWatermark && page.cursor) {
+      next = { ...checkpoint, backlogCursor: page.cursor, pendingLatest };
+    } else {
+      next = { ...checkpoint, stopWatermark: Math.max(checkpoint.stopWatermark ?? 0, pendingLatest ?? 0) || null, pendingLatest: null };
+    }
+  }
   const statements: D1PreparedStatement[] = [];
   const posts = postsStatement(db, page.statuses, "search", query.query, checkedAt);
   if (posts) statements.push(posts);
-  const stateKey = searchQueryStateKey(query.id);
-  if (page.cursor) {
-    statements.push(stateStatement(db, stateKey, JSON.stringify({ query: query.query, cursor: page.cursor }), checkedAt));
-  } else {
-    statements.push(db.prepare("UPDATE search_queries SET last_checked_at = ? WHERE id = ?").bind(checkedAt, query.id));
-    statements.push(db.prepare("DELETE FROM collector_state WHERE key = ?").bind(stateKey));
-  }
+  statements.push(db.prepare("UPDATE search_queries SET last_checked_at = ? WHERE id = ?").bind(checkedAt, query.id));
+  statements.push(stateStatement(db, searchQueryStateKey(query.id), searchCheckpointValue(query, next), checkedAt));
+  await db.batch(statements);
+  return next;
+}
+
+async function saveSearchBacklog(
+  db: D1Database,
+  query: DbQuery,
+  checkpoint: SearchQueryCheckpoint,
+  page: { statuses: ApiStatus[]; cursor: string | null },
+  checkedAt: string,
+): Promise<void> {
+  const oldest = oldestStatusTimestamp(page.statuses);
+  const latest = newestStatusTimestamp(page.statuses);
+  const reachedStop = checkpoint.stopWatermark !== null && oldest !== null && oldest <= checkpoint.stopWatermark;
+  const complete = page.cursor === null || reachedStop;
+  const next: SearchQueryCheckpoint = complete
+    ? {
+        query: query.query,
+        backlogCursor: null,
+        stopWatermark: Math.max(checkpoint.stopWatermark ?? 0, checkpoint.pendingLatest ?? 0, latest ?? 0) || null,
+        pendingLatest: null,
+      }
+    : { ...checkpoint, backlogCursor: page.cursor };
+  const statements: D1PreparedStatement[] = [];
+  const posts = postsStatement(db, page.statuses, "search", query.query, checkedAt);
+  if (posts) statements.push(posts);
+  statements.push(stateStatement(db, searchQueryStateKey(query.id), searchCheckpointValue(query, next), checkedAt));
   await db.batch(statements);
 }
 
@@ -510,12 +580,18 @@ async function collectSearchQueries(db: D1Database, nowMs: number): Promise<numb
   for (const query of selected) {
     try {
       const checkpoint = await readSearchQueryCheckpoint(db, query);
-      const params = new URLSearchParams({ q: query.query, feed: "latest", count: String(SEARCH_API_COUNT) });
-      if (checkpoint?.cursor) params.set("cursor", checkpoint.cursor);
-      const body = await fetchApi(`${API_BASE}/2/search?${params}`, `query:${query.query}`, { allowNotFoundEmpty: true });
-      const page = normalizeStatusPage(body);
-      if (page.statuses.length > SEARCH_API_COUNT) throw new Error(`query:${query.query}: upstream returned more than ${SEARCH_API_COUNT} statuses`);
-      await saveQueryPosts(db, query, page, checkedAt);
+      const latestParams = new URLSearchParams({ q: query.query, feed: "latest", count: String(SEARCH_API_COUNT) });
+      const latestBody = await fetchApi(`${API_BASE}/2/search?${latestParams}`, `query:${query.query}`, { allowNotFoundEmpty: true });
+      const latestPage = normalizeStatusPage(latestBody);
+      if (latestPage.statuses.length > SEARCH_API_COUNT) throw new Error(`query:${query.query}: upstream returned more than ${SEARCH_API_COUNT} statuses`);
+      const next = await saveSearchLatest(db, query, checkpoint, latestPage, checkedAt);
+      if (next.backlogCursor) {
+        const backlogParams = new URLSearchParams({ q: query.query, feed: "latest", count: String(SEARCH_API_COUNT), cursor: next.backlogCursor });
+        const backlogBody = await fetchApi(`${API_BASE}/2/search?${backlogParams}`, `query:${query.query}:backlog`, { allowNotFoundEmpty: true });
+        const backlogPage = normalizeStatusPage(backlogBody);
+        if (backlogPage.statuses.length > SEARCH_API_COUNT) throw new Error(`query:${query.query}: upstream returned more than ${SEARCH_API_COUNT} backlog statuses`);
+        await saveSearchBacklog(db, query, next, backlogPage, checkedAt);
+      }
     } catch (error) {
       logSourceFailure(`query:${query.query}`, error);
     }
