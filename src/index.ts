@@ -261,7 +261,7 @@ export function normalizeAccount(value: unknown): ApiAccount | null {
 }
 
 function findArray(value: unknown, names: string[], depth = 0): unknown[] | null {
-  if (Array.isArray(value)) return value;
+  if (Array.isArray(value)) return depth === 0 ? value : null;
   if (!isRecord(value) || depth > 3) return null;
   for (const name of names) {
     if (Array.isArray(value[name])) return value[name];

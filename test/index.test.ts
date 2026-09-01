@@ -366,6 +366,23 @@ describe("FxEmbed collector", () => {
     expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_sync_at").first<{ value: string }>())?.value).toBe(previous);
   });
 
+  it("does not treat an unrelated array as an empty following list", async () => {
+    const previous = "2023-11-14T22:00:00.000Z";
+    await db.batch([
+      db.prepare("INSERT INTO accounts (id, handle, name, sync_marker) VALUES (?, ?, ?, ?)").bind("old", "old", "Old", "old-marker"),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_source_handle", "source", previous),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_cursor", "old-cursor", previous),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_marker", "old-marker", previous),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_sync_at", previous, previous),
+    ]);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ errors: [], cursor: { bottom: null } })));
+
+    await expect(syncFollowingPage(db, "source", 1_700_000_100_000)).rejects.toThrow(/no following list/);
+    expect((await db.prepare("SELECT handle FROM accounts").all<{ handle: string }>()).results).toEqual([{ handle: "old" }]);
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_cursor").first<{ value: string }>())?.value).toBe("old-cursor");
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_marker").first<{ value: string }>())?.value).toBe("old-marker");
+  });
+
   it("does not checkpoint an account when the response cursor is missing", async () => {
     await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind("a", "alice", "Alice").run();
     await markFollowingAsCurrent();
