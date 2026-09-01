@@ -1,6 +1,6 @@
 # X 投稿フィード Worker
 
-これは Cloudflare Workers で動かす X 投稿収集 Worker です。まずローカルで試します。対象は following と検索語です。FxEmbed API v2 の結果を Cloudflare D1 に保存し、ChatGPT から読み書きできる JSON API を提供します。初回は「セットアップ」「検索語を管理する」「収集」「推薦候補を読む」の順に読み、障害時の動きと用語集は必要なときに参照してください。
+これは Cloudflare Workers で動かす X 投稿収集 Worker です。対象は following と検索語です。FxEmbed API v2 の結果を Cloudflare D1 に保存し、ChatGPT が直接呼べる認証付き MCP と、確認用の JSON API を提供します。
 
 ## セットアップ
 
@@ -28,9 +28,12 @@ Workersへ配置するときは、同じ名前の `ADMIN_TOKEN` を Workers Secr
 ```sh
 npx wrangler d1 create rss-curator
 # 表示された database_id を wrangler.jsonc に設定する
+npx wrangler kv namespace create OAUTH_KV
+# 表示された id を wrangler.jsonc の OAUTH_KV に設定する
 npx wrangler d1 migrations apply rss-curator --remote
 npx wrangler secret put ADMIN_TOKEN
 # wrangler.jsonc の vars.SOURCE_HANDLE に対象アカウントを設定する
+# vars.MCP_ALLOWED_HOST に rss-curator.<subdomain>.workers.dev など、公開URLのhostnameだけを設定する
 npx wrangler deploy
 ```
 
@@ -116,15 +119,32 @@ curl "http://localhost:8787/candidates?limit=20&hours=24"
 
 `limit` は1〜50、`hours` は0より大きく24以下です。返却値の `criteria` に今回適用した基準、各投稿の `selection` に点数と判定材料が入ります。画像は `media`、引用は `quote` で確認できます。すべての投稿を時系列で確認したい場合だけ `GET /feed` を使います。
 
-## ChatGPT から依頼する例
+## ChatGPT から使う
 
-検索語を変える場合は、ChatGPTが `GET /queries` で現在値を確認し、会話から選んだ検索語全体を `PUT /queries` へ送ります。通常のChatGPTから呼び出すには、このWorkerのURLと `ADMIN_TOKEN` を利用できるコネクタまたはツールが必要です。トークンを会話本文へ貼り付けないでください。
+Worker は `/mcp` に Streamable HTTP のMCPサーバーを公開します。次の3ツールをChatGPTが会話から呼び出せます。
 
-推薦を受ける場合は `GET /candidates` の JSON を取得し、その `posts` を次のように渡します。
+- `get_recommendation_candidates`: 推薦候補を取得
+- `get_search_queries`: 現在の検索語を確認
+- `replace_search_queries`: 検索語全体を置換
 
-> `/candidates?limit=20&hours=24` の posts を読み、検索語の一致だけで選ばず、具体性、意外性、実用性、人間への洞察、画像の内容を見て候補を選んでください。各候補について、投稿 ID、URL、要約、推薦理由を返してください。候補がなければ「該当なし」と理由を書いてください。引用投稿は本文と quote の両方を比較してください。
+ローカルでは、Workerを起動してMCP Inspectorから接続を確認します。
 
-Worker は反応数と投稿形式による足切りまで担当します。内容が本当に面白いか、どの理由で勧めるか、候補が0件でよいかは ChatGPT が判断します。Worker は ML、embedding、OpenAI API を使いません。
+```sh
+npx wrangler dev --test-scheduled
+npx @modelcontextprotocol/inspector@latest
+```
+
+Inspectorに `http://127.0.0.1:8787/mcp` を指定し、OAuthの認可画面で `.dev.vars` の `ADMIN_TOKEN` を入力します。3ツールの一覧表示と呼び出しを確認してください。
+
+ChatGPTから利用するには、Workerを配置して公開HTTPS URLを用意します。ChatGPTの「設定」→「Security and login」でDeveloper modeを有効にし、[ChatGPT Plugins](https://chatgpt.com/plugins) の追加ボタンから `https://<WorkerのURL>/mcp` を登録します。表示された認可画面に `ADMIN_TOKEN` を入力し、新しい会話のツールメニューでこの接続を有効にします。Developer modeの利用可否はアカウントやワークスペースの設定に依存します。詳しい画面手順は[OpenAI公式の接続手順](https://developers.openai.com/plugins/deploy/connect-chatgpt)を参照してください。
+
+`ADMIN_TOKEN` はWorkerの認可画面だけに入力し、会話本文へは貼り付けません。会話では、たとえば次のように依頼できます。
+
+> 今日の推薦候補を見て、検索語の一致だけで選ばず、具体性、意外性、実用性、人間への洞察、画像の内容から読む価値のある投稿だけ教えて。なければ「該当なし」でよい。
+
+> 今の検索語を見せて。「Cloudflare Workers」「地方鉄道」「プロダクトデザイン」に置き換えて。
+
+Worker は反応数と投稿形式による足切りまで担当します。内容が本当に面白いか、推薦理由、候補が0件でよいかは ChatGPT が判断します。Worker は ML、embedding、OpenAI API を使いません。
 
 ## 障害時の動き
 

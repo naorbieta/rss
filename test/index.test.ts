@@ -1502,6 +1502,183 @@ describe("feed", () => {
   });
 });
 
+describe("ChatGPT MCP connector", () => {
+  const oauthEnv = { ...env, ADMIN_TOKEN: "test-admin-token" };
+  const redirectUri = "https://client.example/callback";
+  const verifier = "mcp-test-verifier-abcdefghijklmnopqrstuvwxyz-0123456789";
+
+  async function pkceChallenge(): Promise<string> {
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+    return btoa(String.fromCharCode(...digest)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+  }
+
+  async function registerClient(): Promise<string> {
+    const response = await worker.fetch(new Request("https://localhost/oauth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_name: "MCP test client",
+        redirect_uris: [redirectUri],
+        grant_types: ["authorization_code"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",
+      }),
+    }), oauthEnv);
+    expect(response.status).toBe(201);
+    return ((await response.json()) as { client_id: string }).client_id;
+  }
+
+  async function beginAuthorization(clientId: string): Promise<{ flow: string; csrf: string; cookie: string }> {
+    const url = new URL("https://localhost/authorize");
+    url.search = new URLSearchParams({
+      response_type: "code",
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      state: "test-state",
+      code_challenge: await pkceChallenge(),
+      code_challenge_method: "S256",
+      scope: "mcp",
+      resource: "https://localhost/mcp",
+    }).toString();
+    const response = await worker.fetch(new Request(url), oauthEnv);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const html = await response.text();
+    expect(html).toContain("MCP test client");
+    expect(html).toContain("https://client.example");
+    const flow = html.match(/name="flow" value="([^"]+)"/)?.[1];
+    const csrf = html.match(/name="csrf" value="([^"]+)"/)?.[1];
+    expect(flow).toBeTruthy();
+    expect(csrf).toBeTruthy();
+    return { flow: flow ?? "", csrf: csrf ?? "", cookie: response.headers.get("set-cookie") ?? "" };
+  }
+
+  function approvalRequest(pending: { flow: string; csrf: string; cookie: string }, token: string, csrf = pending.csrf): Request {
+    return new Request("https://localhost/approve", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: pending.cookie },
+      body: new URLSearchParams({ flow: pending.flow, csrf, token }),
+    });
+  }
+
+  async function approveAuthorization(clientId: string): Promise<{ code: string; pending: { flow: string; csrf: string; cookie: string } }> {
+    const pending = await beginAuthorization(clientId);
+    const response = await worker.fetch(approvalRequest(pending, "test-admin-token"), oauthEnv);
+    expect(response.status).toBe(302);
+    const redirect = new URL(response.headers.get("location") ?? "");
+    expect(redirect.origin + redirect.pathname).toBe(redirectUri);
+    expect(redirect.searchParams.get("state")).toBe("test-state");
+    return { code: redirect.searchParams.get("code") ?? "", pending };
+  }
+
+  async function accessToken(clientId: string, code: string): Promise<string> {
+    const response = await worker.fetch(new Request("https://localhost/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: clientId,
+        code,
+        redirect_uri: redirectUri,
+        code_verifier: verifier,
+        resource: "https://localhost/mcp",
+      }),
+    }), oauthEnv);
+    expect(response.status).toBe(200);
+    return ((await response.json()) as { access_token: string }).access_token;
+  }
+
+  async function mcp(token: string, id: number, method: string, params: JsonObject = {}): Promise<JsonObject> {
+    const response = await worker.fetch(new Request("https://localhost/mcp", {
+      method: "POST",
+      headers: {
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        host: "localhost",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+    }), oauthEnv);
+    const text = await response.text();
+    if (response.status !== 200) throw new Error(`MCP ${response.status}: ${text}`);
+    const payload = response.headers.get("content-type")?.includes("text/event-stream")
+      ? text.split("\n").find((line) => line.startsWith("data: "))?.slice(6)
+      : text;
+    return JSON.parse(payload ?? "") as JsonObject;
+  }
+
+  type JsonObject = Record<string, unknown>;
+
+  it("requires OAuth and exposes candidate and query tools through MCP", async () => {
+    const unauthorized = await worker.fetch(new Request("https://localhost/mcp", { method: "POST" }), oauthEnv);
+    expect(unauthorized.status).toBe(401);
+    expect(unauthorized.headers.get("www-authenticate")).toContain("resource_metadata=");
+
+    const clientId = await registerClient();
+    const pending = await beginAuthorization(clientId);
+    const csrfRejected = await worker.fetch(approvalRequest(pending, "test-admin-token", "wrong"), oauthEnv);
+    expect(csrfRejected.status).toBe(400);
+    const rejected = await worker.fetch(approvalRequest(pending, "wrong"), oauthEnv);
+    expect(rejected.status).toBe(401);
+    const replayed = await worker.fetch(approvalRequest(pending, "test-admin-token"), oauthEnv);
+    expect(replayed.status).toBe(400);
+
+    const approved = await approveAuthorization(clientId);
+    const successReplay = await worker.fetch(approvalRequest(approved.pending, "test-admin-token"), oauthEnv);
+    expect(successReplay.status).toBe(400);
+    const token = await accessToken(clientId, approved.code);
+    const hostileHost = await worker.fetch(new Request("https://localhost/mcp", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, host: "evil.example", "content-type": "application/json" },
+      body: "{}",
+    }), oauthEnv);
+    expect(hostileHost.status).toBe(403);
+    const hostileOrigin = await worker.fetch(new Request("https://localhost/mcp", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, host: "localhost", origin: "https://evil.example", "content-type": "application/json" },
+      body: "{}",
+    }), oauthEnv);
+    expect(hostileOrigin.status).toBe(403);
+    const initialized = await mcp(token, 1, "initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "test-client", version: "1.0.0" },
+    });
+    expect(initialized).toHaveProperty("result.serverInfo.name", "x-post-curator");
+
+    const listed = await mcp(token, 2, "tools/list");
+    const tools = (listed.result as { tools: Array<{ name: string }> }).tools.map((tool) => tool.name);
+    expect(tools).toEqual([
+      "get_recommendation_candidates",
+      "get_search_queries",
+      "replace_search_queries",
+    ]);
+
+    const replaced = await mcp(token, 3, "tools/call", {
+      name: "replace_search_queries",
+      arguments: { queries: ["Cloudflare Workers", "地方鉄道"] },
+    });
+    expect(replaced).toHaveProperty("result.structuredContent.queries.0.query", "Cloudflare Workers");
+    const queried = await mcp(token, 4, "tools/call", { name: "get_search_queries", arguments: {} });
+    expect(queried).toHaveProperty("result.structuredContent.queries.1.query", "地方鉄道");
+    const candidates = await mcp(token, 5, "tools/call", {
+      name: "get_recommendation_candidates",
+      arguments: { limit: 20, hours: 24 },
+    });
+    expect(candidates).toHaveProperty("result.structuredContent.posts");
+  });
+
+  it("consumes an authorization request once under concurrent approval", async () => {
+    const clientId = await registerClient();
+    const pending = await beginAuthorization(clientId);
+    const responses = await Promise.all([
+      worker.fetch(approvalRequest(pending, "test-admin-token"), oauthEnv),
+      worker.fetch(approvalRequest(pending, "test-admin-token"), oauthEnv),
+    ]);
+    expect(responses.map((response) => response.status).sort()).toEqual([302, 400]);
+  });
+});
+
 describe("candidates", () => {
   it("removes near-zero search results and ranks bookmark-like posts with media details", async () => {
     const now = Math.floor(Date.now() / 1000);

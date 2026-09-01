@@ -1,3 +1,19 @@
+import {
+  AuthorizationError,
+  OAuthProvider,
+  type AuthRequest,
+  type OAuthHelpers,
+} from "@cloudflare/workers-oauth-provider";
+import {
+  createMcpHandler,
+  hostHeaderValidationResponse,
+  localhostAllowedHostnames,
+  localhostAllowedOrigins,
+  McpServer,
+  originValidationResponse,
+} from "@modelcontextprotocol/server";
+import { z } from "zod";
+
 type JsonRecord = Record<string, unknown>;
 
 type ApiStatus = {
@@ -88,8 +104,12 @@ type DbFeedRow = {
   source_key: string;
 };
 
-type WorkerEnv = Cloudflare.Env;
+type WorkerEnv = Cloudflare.Env & {
+  OAUTH_KV: KVNamespace;
+  OAUTH_PROVIDER: OAuthHelpers;
+};
 type RuntimeEnv = Pick<WorkerEnv, "DB"> & { SOURCE_HANDLE: string };
+type AppEnv = RuntimeEnv & Pick<WorkerEnv, "ADMIN_TOKEN"> & Partial<Pick<WorkerEnv, "OAUTH_KV" | "OAUTH_PROVIDER">>;
 
 const API_BASE = "https://api.fxtwitter.com";
 const FETCH_TIMEOUT_MS = 10_000;
@@ -103,6 +123,7 @@ const MAX_QUERIES_PER_RUN = 1;
 const MAX_MANAGED_QUERIES = 20;
 const MAX_QUERY_LENGTH = 200;
 const MAX_QUERY_BODY_BYTES = 32 * 1024;
+const MAX_OAUTH_BODY_BYTES = 4 * 1024;
 const MAX_CANDIDATE_LIMIT = 50;
 const MAX_CANDIDATE_HOURS = 24;
 const FOLLOWING_RESYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -112,6 +133,9 @@ const ACCOUNT_STATUS_STATE_PREFIX = "account_status:";
 const SEARCH_QUERY_STATE_PREFIX = "search_query:";
 const FOLLOWING_PENDING_SOURCE_KEY = "following_pending_source_handle";
 const COLLECTION_LEASE_KEY = "collection_lease";
+const OAUTH_REQUEST_PREFIX = "oauth_request:";
+const OAUTH_REQUEST_TTL_SECONDS = 10 * 60;
+const MCP_SCOPES = ["mcp"];
 
 function isRecord(value: unknown): value is JsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -1001,22 +1025,26 @@ function json(value: unknown, status = 200, headers?: HeadersInit): Response {
   });
 }
 
-async function hasAdminAccess(request: Request, expectedToken: string): Promise<boolean> {
-  const authorization = request.headers.get("authorization") ?? "";
-  const providedToken = authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : "";
+async function secretsMatch(provided: string, expected: string): Promise<boolean> {
   const encoder = new TextEncoder();
   // Vitest also loads Node's WebCrypto type, which omits this Workers runtime method.
   const subtle = crypto.subtle as typeof crypto.subtle & {
     timingSafeEqual(a: ArrayBuffer | ArrayBufferView, b: ArrayBuffer | ArrayBufferView): boolean;
   };
   const [providedHash, expectedHash] = await Promise.all([
-    subtle.digest("SHA-256", encoder.encode(providedToken)),
-    subtle.digest("SHA-256", encoder.encode(expectedToken)),
+    subtle.digest("SHA-256", encoder.encode(provided)),
+    subtle.digest("SHA-256", encoder.encode(expected)),
   ]);
   return subtle.timingSafeEqual(providedHash, expectedHash);
 }
 
-async function readBoundedBody(request: Request): Promise<Uint8Array | null> {
+async function hasAdminAccess(request: Request, expectedToken: string): Promise<boolean> {
+  const authorization = request.headers.get("authorization") ?? "";
+  const providedToken = authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : "";
+  return secretsMatch(providedToken, expectedToken);
+}
+
+async function readBoundedBody(request: Request, maxBytes = MAX_QUERY_BODY_BYTES): Promise<Uint8Array | null> {
   if (!request.body) return new Uint8Array();
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -1026,7 +1054,7 @@ async function readBoundedBody(request: Request): Promise<Uint8Array | null> {
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > MAX_QUERY_BODY_BYTES) {
+      if (total > maxBytes) {
         await reader.cancel();
         return null;
       }
@@ -1054,6 +1082,43 @@ async function listManagedQueries(db: D1Database): Promise<ManagedQuery[]> {
   return rows.results;
 }
 
+type ManagedQueryValidation =
+  | { queries: string[] }
+  | { error: string; message: string };
+
+function validateManagedQueries(value: unknown): ManagedQueryValidation {
+  if (!isRecord(value) || !Array.isArray(value.queries)) {
+    return { error: "invalid_queries", message: "queries は文字列の配列で指定してください" };
+  }
+  if (value.queries.length > MAX_MANAGED_QUERIES) {
+    return { error: "invalid_queries", message: `queries は ${MAX_MANAGED_QUERIES} 件以下にしてください` };
+  }
+
+  const queries: string[] = [];
+  for (const item of value.queries) {
+    if (typeof item !== "string" || !item.trim() || Array.from(item.trim()).length > MAX_QUERY_LENGTH) {
+      return { error: "invalid_queries", message: `各検索語は1〜${MAX_QUERY_LENGTH}文字の文字列にしてください` };
+    }
+    queries.push(item.trim());
+  }
+  if (new Set(queries.map((query) => query.toLowerCase())).size !== queries.length) {
+    return { error: "invalid_queries", message: "queries に重複した検索語を指定しないでください" };
+  }
+  return { queries };
+}
+
+async function applyManagedQueries(db: D1Database, queries: string[]): Promise<ManagedQuery[]> {
+  const statements = [db.prepare("UPDATE search_queries SET enabled = 0 WHERE enabled = 1")];
+  if (queries.length) {
+    statements.push(db.prepare(`
+      INSERT INTO search_queries (query, enabled) VALUES ${queries.map(() => "(?, 1)").join(", ")}
+      ON CONFLICT(query) DO UPDATE SET enabled = 1
+    `).bind(...queries));
+  }
+  await db.batch(statements);
+  return listManagedQueries(db);
+}
+
 async function replaceManagedQueries(request: Request, env: WorkerEnv): Promise<Response> {
   const contentType = request.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
   if (contentType !== "application/json") {
@@ -1074,33 +1139,9 @@ async function replaceManagedQueries(request: Request, env: WorkerEnv): Promise<
   } catch {
     return json({ error: "invalid_json", message: "有効な JSON を送信してください" }, 400);
   }
-  if (!isRecord(value) || !Array.isArray(value.queries)) {
-    return json({ error: "invalid_queries", message: "queries は文字列の配列で指定してください" }, 400);
-  }
-  if (value.queries.length > MAX_MANAGED_QUERIES) {
-    return json({ error: "invalid_queries", message: `queries は ${MAX_MANAGED_QUERIES} 件以下にしてください` }, 400);
-  }
-
-  const queries: string[] = [];
-  for (const item of value.queries) {
-    if (typeof item !== "string" || !item.trim() || Array.from(item.trim()).length > MAX_QUERY_LENGTH) {
-      return json({ error: "invalid_queries", message: `各検索語は1〜${MAX_QUERY_LENGTH}文字の文字列にしてください` }, 400);
-    }
-    queries.push(item.trim());
-  }
-  if (new Set(queries.map((query) => query.toLowerCase())).size !== queries.length) {
-    return json({ error: "invalid_queries", message: "queries に重複した検索語を指定しないでください" }, 400);
-  }
-
-  const statements = [env.DB.prepare("UPDATE search_queries SET enabled = 0 WHERE enabled = 1")];
-  if (queries.length) {
-    statements.push(env.DB.prepare(`
-      INSERT INTO search_queries (query, enabled) VALUES ${queries.map(() => "(?, 1)").join(", ")}
-      ON CONFLICT(query) DO UPDATE SET enabled = 1
-    `).bind(...queries));
-  }
-  await env.DB.batch(statements);
-  return json({ queries: await listManagedQueries(env.DB) });
+  const validation = validateManagedQueries(value);
+  if ("error" in validation) return json(validation, 400);
+  return json({ queries: await applyManagedQueries(env.DB, validation.queries) });
 }
 
 async function manageQueries(request: Request, env: WorkerEnv): Promise<Response> {
@@ -1305,21 +1346,224 @@ export async function candidates(request: Request, env: RuntimeEnv): Promise<Res
   });
 }
 
-const worker = {
-  async fetch(request: Request, env: WorkerEnv): Promise<Response> {
-    try {
-      const url = new URL(request.url);
-      if (request.method === "GET" && url.pathname === "/feed") return await feed(request, env);
-      if (request.method === "GET" && url.pathname === "/candidates") return await candidates(request, env);
-      if (url.pathname === "/queries") return await manageQueries(request, env);
-      return json({ error: "not_found" }, 404);
-    } catch (error) {
-      console.error(JSON.stringify({ event: "request_failed", error: error instanceof Error ? error.message : String(error) }));
-      return json({ error: "internal_error" }, 500);
+function mcpSuccess(value: JsonRecord) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(value) }],
+    structuredContent: value,
+  };
+}
+
+function createCuratorMcpServer(env: WorkerEnv): McpServer {
+  const server = new McpServer({ name: "x-post-curator", version: "1.0.0" });
+  server.registerTool("get_recommendation_candidates", {
+    title: "Xの推薦候補を取得",
+    description: "反応数と投稿形式で足切り・順位づけしたX投稿候補を取得します。内容の面白さと推薦理由は会話側で判断してください。",
+    inputSchema: z.object({
+      limit: z.number().int().min(1).max(MAX_CANDIDATE_LIMIT).default(20),
+      hours: z.number().positive().max(MAX_CANDIDATE_HOURS).default(24),
+    }),
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async ({ limit, hours }) => {
+    const response = await candidates(new Request(`https://worker.invalid/candidates?limit=${limit}&hours=${hours}`), env);
+    const value = await response.json() as JsonRecord;
+    return response.ok
+      ? mcpSuccess(value)
+      : { isError: true, content: [{ type: "text" as const, text: JSON.stringify(value) }] };
+  });
+  server.registerTool("get_search_queries", {
+    title: "検索語を確認",
+    description: "現在有効なX検索語と最終確認時刻を取得します。",
+    inputSchema: z.object({}),
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async () => mcpSuccess({ queries: await listManagedQueries(env.DB) }));
+  server.registerTool("replace_search_queries", {
+    title: "検索語を置換",
+    description: "現在有効なX検索語を指定した配列で全置換します。空配列では検索収集を停止します。",
+    inputSchema: z.object({ queries: z.array(z.string()).max(MAX_MANAGED_QUERIES) }),
+    annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  }, async ({ queries }) => {
+    const validation = validateManagedQueries({ queries });
+    if ("error" in validation) {
+      return { isError: true, content: [{ type: "text" as const, text: validation.message }] };
     }
+    return mcpSuccess({ queries: await applyManagedQueries(env.DB, validation.queries) });
+  });
+  return server;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  })[character] ?? character);
+}
+
+function oauthHtml(body: string, status = 200, headers: HeadersInit = {}): Response {
+  return new Response(`<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>X投稿キュレーターの接続</title><style>body{font:16px system-ui;max-width:34rem;margin:4rem auto;padding:0 1rem;line-height:1.6}label,input,button{display:block;width:100%;box-sizing:border-box}input,button{font:inherit;padding:.7rem;margin-top:.4rem}button{margin-top:1rem}</style><body>${body}</body></html>`, {
+    status,
+    headers: {
+      "cache-control": "no-store",
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+      "content-type": "text/html; charset=utf-8",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
+      ...headers,
+    },
+  });
+}
+
+function oauthErrorResponse(error: AuthorizationError): Response {
+  if (!error.redirectUri) return oauthHtml(`<h1>接続できません</h1><p>${escapeHtml(error.description)}</p>`, 400);
+  const redirect = new URL(error.redirectUri);
+  redirect.searchParams.set("error", error.code);
+  redirect.searchParams.set("error_description", error.description);
+  if (error.state) redirect.searchParams.set("state", error.state);
+  if (error.issuer) redirect.searchParams.set("iss", error.issuer);
+  return Response.redirect(redirect, 302);
+}
+
+async function authorize(request: Request, env: WorkerEnv): Promise<Response> {
+  let oauthRequest: AuthRequest;
+  try {
+    oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+  } catch (error) {
+    if (error instanceof AuthorizationError) return oauthErrorResponse(error);
+    throw error;
+  }
+  const client = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
+  if (!client) return oauthHtml("<h1>接続元を確認できません</h1>", 400);
+  const clientName = client.clientName ?? "名前のないMCPクライアント";
+  const redirectOrigin = new URL(oauthRequest.redirectUri).origin;
+  const flow = crypto.randomUUID();
+  const csrf = crypto.randomUUID();
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - OAUTH_REQUEST_TTL_SECONDS * 1000).toISOString();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM collector_state WHERE key LIKE ? AND updated_at < ?").bind(`${OAUTH_REQUEST_PREFIX}%`, cutoff),
+    env.DB.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind(
+      `${OAUTH_REQUEST_PREFIX}${flow}`,
+      JSON.stringify({ request: oauthRequest, csrf, clientName }),
+      now.toISOString(),
+    ),
+  ]);
+  const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
+  return oauthHtml(`<h1>接続を許可</h1><p><strong>${escapeHtml(clientName)}</strong>（${escapeHtml(redirectOrigin)}）が、推薦候補と検索語の取得、検索語の置換を要求しています。</p><form method="post" action="/approve"><input type="hidden" name="flow" value="${flow}"><input type="hidden" name="csrf" value="${csrf}"><label>管理トークン<input type="password" name="token" required autocomplete="current-password"></label><button type="submit">許可する</button></form>`, 200, {
+    "set-cookie": `oauth_csrf=${csrf}; Path=/approve; Max-Age=${OAUTH_REQUEST_TTL_SECONDS}; HttpOnly; SameSite=Lax${secure}`,
+  });
+}
+
+function cookieValue(request: Request, name: string): string {
+  for (const part of (request.headers.get("cookie") ?? "").split(";")) {
+    const [key, ...value] = part.trim().split("=");
+    if (key === name) return value.join("=");
+  }
+  return "";
+}
+
+async function approve(request: Request, env: WorkerEnv): Promise<Response> {
+  if (request.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() !== "application/x-www-form-urlencoded") {
+    return oauthHtml("<h1>不正なリクエストです</h1>", 415);
+  }
+  const bytes = await readBoundedBody(request, MAX_OAUTH_BODY_BYTES);
+  if (bytes === null) return oauthHtml("<h1>リクエストが大きすぎます</h1>", 413);
+  let form: URLSearchParams;
+  try {
+    form = new URLSearchParams(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    return oauthHtml("<h1>不正なリクエストです</h1>", 400);
+  }
+  const flow = form.get("flow") ?? "";
+  const csrf = form.get("csrf") ?? "";
+  const stateKey = `${OAUTH_REQUEST_PREFIX}${flow}`;
+  const cutoff = new Date(Date.now() - OAUTH_REQUEST_TTL_SECONDS * 1000).toISOString();
+  const storedText = /^[0-9a-f-]{36}$/i.test(flow)
+    ? (await env.DB.prepare("SELECT value FROM collector_state WHERE key = ? AND updated_at >= ?")
+      .bind(stateKey, cutoff).first<{ value: string }>())?.value ?? null
+    : null;
+  if (!storedText || !csrf || !await secretsMatch(csrf, cookieValue(request, "oauth_csrf"))) {
+    return oauthHtml("<h1>接続要求の有効期限が切れました</h1><p>ChatGPTから接続をやり直してください。</p>", 400);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(storedText);
+  } catch {
+    return oauthHtml("<h1>接続要求を確認できません</h1>", 400);
+  }
+  if (!isRecord(parsed) || !isRecord(parsed.request) || typeof parsed.csrf !== "string" || typeof parsed.clientName !== "string") {
+    return oauthHtml("<h1>接続要求を確認できません</h1>", 400);
+  }
+  const stored = parsed as { request: AuthRequest; csrf: string; clientName: string };
+  if (!await secretsMatch(csrf, stored.csrf)) {
+    return oauthHtml("<h1>接続要求を確認できません</h1>", 400);
+  }
+  const consumed = await env.DB.prepare("DELETE FROM collector_state WHERE key = ? AND value = ? AND updated_at >= ? RETURNING key")
+    .bind(stateKey, storedText, cutoff).first<{ key: string }>();
+  if (!consumed) {
+    return oauthHtml("<h1>接続要求の有効期限が切れました</h1><p>ChatGPTから接続をやり直してください。</p>", 400);
+  }
+  if (!env.ADMIN_TOKEN) return oauthHtml("<h1>ADMIN_TOKENが設定されていません</h1>", 500);
+  if (!await secretsMatch(form.get("token") ?? "", env.ADMIN_TOKEN)) {
+    return oauthHtml("<h1>管理トークンが違います</h1>", 401);
+  }
+  const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+    request: stored.request,
+    userId: "owner",
+    metadata: { clientName: stored.clientName },
+    scope: stored.request.scope.filter((scope) => MCP_SCOPES.includes(scope)),
+    props: { role: "owner" },
+  });
+  return Response.redirect(redirectTo, 302);
+}
+
+async function appFetch(request: Request, env: WorkerEnv): Promise<Response> {
+  try {
+    const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/feed") return await feed(request, env);
+    if (request.method === "GET" && url.pathname === "/candidates") return await candidates(request, env);
+    if (url.pathname === "/queries") return await manageQueries(request, env);
+    if (request.method === "GET" && url.pathname === "/authorize") return await authorize(request, env);
+    if (request.method === "POST" && url.pathname === "/approve") return await approve(request, env);
+    return json({ error: "not_found" }, 404);
+  } catch (error) {
+    console.error(JSON.stringify({ event: "request_failed", error: error instanceof Error ? error.message : String(error) }));
+    return json({ error: "internal_error" }, 500);
+  }
+}
+
+const mcpApiHandler = {
+  async fetch(request: Request, env: WorkerEnv, _ctx: ExecutionContext) {
+    if (new URL(request.url).pathname !== "/mcp") return json({ error: "not_found" }, 404);
+    const configuredHost = env.MCP_ALLOWED_HOST.trim().toLowerCase();
+    const allowedHostnames = configuredHost ? [configuredHost] : localhostAllowedHostnames();
+    const allowedOrigins = configuredHost ? [configuredHost] : localhostAllowedOrigins();
+    const rejected = hostHeaderValidationResponse(request, allowedHostnames)
+      ?? originValidationResponse(request, allowedOrigins);
+    if (rejected) return rejected;
+    return createMcpHandler(() => createCuratorMcpServer(env)).fetch(request);
+  },
+};
+
+const oauthProvider = new OAuthProvider<WorkerEnv>({
+  apiRoute: "/mcp",
+  apiHandler: mcpApiHandler,
+  defaultHandler: { fetch: appFetch },
+  authorizeEndpoint: "/authorize",
+  tokenEndpoint: "/oauth/token",
+  clientRegistrationEndpoint: "/oauth/register",
+  clientIdMetadataDocumentEnabled: true,
+  scopesSupported: MCP_SCOPES,
+});
+
+const worker = {
+  fetch(request: Request, env: AppEnv, ctx?: ExecutionContext): Promise<Response> {
+    const execution = ctx ?? {
+      waitUntil() {},
+      passThroughOnException() {},
+    } as unknown as ExecutionContext;
+    return oauthProvider.fetch(request, env as WorkerEnv, execution);
   },
 
-  async scheduled(controller: ScheduledController, env: WorkerEnv): Promise<void> {
+  async scheduled(controller: ScheduledController, env: RuntimeEnv): Promise<void> {
     console.log(JSON.stringify({ event: "collection_started", cron: controller.cron, scheduled_time: controller.scheduledTime }));
     const result = await collectOnce(env, controller.scheduledTime);
     console.log(JSON.stringify({ event: "collection_finished", ...result }));

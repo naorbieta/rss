@@ -3,9 +3,11 @@
   "name": "rss-curator",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-31",
-  "compatibility_flags": ["no_nodejs_compat", "no_nodejs_compat_v2"],
+  "compatibility_flags": ["no_nodejs_compat", "no_nodejs_compat_v2", "global_fetch_strictly_public"],
   "vars": {
-    "SOURCE_HANDLE": ""
+    "SOURCE_HANDLE": "",
+    // 本番配置時にMCPの公開hostnameだけを設定します。空のままではlocalhost以外を拒否します。
+    "MCP_ALLOWED_HOST": ""
   },
   "secrets": {
     "required": ["ADMIN_TOKEN"]
@@ -17,6 +19,13 @@
       // ローカル用の仮のIDです。リモートDBの更新・配置前に `wrangler d1 create rss-curator` が返すIDへ必ず置換してください。
       "database_id": "00000000-0000-0000-0000-000000000001",
       "migrations_dir": "migrations"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      // ローカル用の仮のIDです。本番配置前に `wrangler kv namespace create OAUTH_KV` が返すIDへ置換してください。
+      "id": "00000000000000000000000000000000"
     }
   ],
   "triggers": {
