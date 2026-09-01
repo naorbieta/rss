@@ -1245,7 +1245,7 @@ export async function candidates(request: Request, env: RuntimeEnv): Promise<Res
 
   const generatedAtMs = Date.now();
   const cutoff = Math.floor((generatedAtMs - hours * 60 * 60 * 1000) / 1000);
-  // ponytail: scan the strongest 1,000 engagement-ranked rows; move full scoring into SQL only if daily volume hides candidates.
+  // ponytail: split bounded preselection across the 8 format masks; exact score and diversity stay in JS.
   const scanLimit = Math.min(MAX_CANDIDATE_SCAN, Math.max(200, limit * 20));
   const rows = await env.DB.prepare(`
     WITH eligible AS (
@@ -1259,17 +1259,30 @@ export async function candidates(request: Request, env: RuntimeEnv): Promise<Res
         END AS minimum_likes
       FROM posts
       WHERE created_timestamp >= ?
+    ),
+    ranked AS (
+      SELECT eligible.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY
+            CASE WHEN json_type(details_json, '$.media') = 'object' AND json_extract(details_json, '$.media') <> '{}' THEN 1 ELSE 0 END
+            + CASE WHEN json_type(quote_json) = 'object' THEN 2 ELSE 0 END
+            + CASE WHEN length(text) >= 120 THEN 4 ELSE 0 END
+          ORDER BY likes + reposts * 2 + quotes * 3 + bookmarks * 3 DESC,
+            created_timestamp DESC, id DESC
+        ) AS format_rank
+      FROM eligible
+      WHERE likes >= minimum_likes
+        OR bookmarks >= MAX(5, (minimum_likes + 3) / 4)
+        OR (source_kind = 'following' AND likes >= MAX(10, (minimum_likes + 1) / 2))
     )
     SELECT id, url, text, created_timestamp, likes, reposts, quotes, replies,
       author_id, author_screen_name, author_name, quote_json, details_json, source_kind, source_key
-    FROM eligible
-    WHERE likes >= minimum_likes
-      OR bookmarks >= MAX(5, (minimum_likes + 3) / 4)
-      OR (source_kind = 'following' AND likes >= MAX(10, (minimum_likes + 1) / 2))
-    ORDER BY (likes + reposts * 2 + quotes * 3 + bookmarks * 3) DESC,
+    FROM ranked
+    WHERE format_rank <= ?
+    ORDER BY likes + reposts * 2 + quotes * 3 + bookmarks * 3 DESC,
       created_timestamp DESC, id DESC
     LIMIT ?
-  `).bind(generatedAtMs, generatedAtMs, generatedAtMs, cutoff, scanLimit).all<DbFeedRow>();
+  `).bind(generatedAtMs, generatedAtMs, generatedAtMs, cutoff, Math.floor(scanLimit / 8), scanLimit).all<DbFeedRow>();
   const ranked = rows.results
     .map((row) => candidateFor(row, generatedAtMs))
     .filter((post) => post !== null)

@@ -1651,6 +1651,47 @@ describe("candidates", () => {
     expect(body.posts[0]).toMatchObject({ id: "bookmark-qualified", bookmarks: 100 });
   });
 
+  it("keeps a format-rich candidate when plain eligible rows fill the scan", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const createdTimestamp = now - 23 * 3600;
+    const collectedAt = new Date(now * 1000).toISOString();
+    await db.prepare(`WITH RECURSIVE noise(n) AS (
+      SELECT 1
+      UNION ALL
+      SELECT n + 1 FROM noise WHERE n < 200
+    )
+    INSERT INTO posts
+      (id, url, text, created_timestamp, likes, reposts, quotes, replies, author_id,
+       author_screen_name, author_name, quote_json, details_json, source_kind, source_key, collected_at)
+    SELECT
+      'plain-' || n, 'https://x.com/plain/status/' || n, 'プレーンな適格投稿', ?, 130, 0, 0, 0,
+      'plain-' || n, 'plain-' || n, 'Plain', NULL, NULL, 'search', 'plain query', ?
+    FROM noise`).bind(createdTimestamp, collectedAt).run();
+    await db.prepare(`INSERT INTO posts
+      (id, url, text, created_timestamp, likes, reposts, quotes, replies, author_id,
+       author_screen_name, author_name, quote_json, details_json, source_kind, source_key, collected_at)
+      VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, 'search', ?, ?)`).bind(
+      "format-rich",
+      "https://x.com/target/status/format-rich",
+      "具体的な長文の知見".repeat(40),
+      createdTimestamp,
+      96,
+      "target",
+      "target",
+      "Target",
+      JSON.stringify({ id: "quoted" }),
+      JSON.stringify({ media: { photos: [{ url: "https://example.com/target.jpg" }] } }),
+      "target query",
+      collectedAt,
+    ).run();
+
+    const response = await worker.fetch(new Request("https://localhost/candidates?hours=24&limit=1"), env);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { posts: Array<{ id: string; selection: { signals: string[] } }> };
+    expect(body.posts.map((post) => post.id)).toEqual(["format-rich"]);
+    expect(body.posts[0].selection.signals).toEqual(expect.arrayContaining(["media", "quote", "detailed"]));
+  });
+
   it("keeps a following-qualified post when ineligible search rows fill the scan", async () => {
     const now = Math.floor(Date.now() / 1000);
     const createdTimestamp = now - 23 * 3600;
