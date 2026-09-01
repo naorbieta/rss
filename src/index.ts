@@ -21,6 +21,8 @@ type StatusPresence = {
   reposts: boolean;
   quotes: boolean;
   replies: boolean;
+  authorId: boolean;
+  authorName: boolean;
 };
 
 type ApiAccount = {
@@ -187,8 +189,10 @@ export function normalizeStatus(value: unknown): ApiStatus | null {
   const timestamp = asTimestamp(value.created_timestamp ?? value.createdTimestamp);
   if (!id || !screenName || !timestamp) return null;
 
-  const authorId = asId(authorValue?.id) ?? screenName;
-  const name = asString(authorValue?.name) ?? screenName;
+  const authorIdValue = asId(authorValue?.id);
+  const authorNameValue = asString(authorValue?.name);
+  const authorId = authorIdValue ?? screenName;
+  const name = authorNameValue ?? screenName;
   const url = asString(value.url) ?? `https://x.com/${encodeURIComponent(screenName)}/status/${id}`;
   const likes = statusCounter(value, ["likes"]);
   const reposts = statusCounter(value, ["retweets", "reposts"]);
@@ -200,6 +204,8 @@ export function normalizeStatus(value: unknown): ApiStatus | null {
     reposts: reposts.present,
     quotes: quotes.present,
     replies: replies.present,
+    authorId: authorIdValue !== null,
+    authorName: authorNameValue !== null,
   };
   return {
     id,
@@ -443,9 +449,9 @@ function postsStatements(
       ON CONFLICT(id) DO UPDATE SET
         url = excluded.url,
         text = CASE WHEN json_extract(excluded.details_json, '$._counter_presence.text') = 0 THEN posts.text ELSE excluded.text END,
-        author_id = excluded.author_id,
+        author_id = CASE WHEN json_extract(excluded.details_json, '$._counter_presence.authorId') = 0 THEN posts.author_id ELSE excluded.author_id END,
         author_screen_name = excluded.author_screen_name,
-        author_name = excluded.author_name,
+        author_name = CASE WHEN json_extract(excluded.details_json, '$._counter_presence.authorName') = 0 THEN posts.author_name ELSE excluded.author_name END,
         likes = CASE WHEN json_extract(excluded.details_json, '$._counter_presence.likes') = 0 THEN posts.likes ELSE excluded.likes END,
         reposts = CASE WHEN json_extract(excluded.details_json, '$._counter_presence.reposts') = 0 THEN posts.reposts ELSE excluded.reposts END,
         quotes = CASE WHEN json_extract(excluded.details_json, '$._counter_presence.quotes') = 0 THEN posts.quotes ELSE excluded.quotes END,

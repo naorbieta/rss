@@ -172,7 +172,9 @@ describe("FxEmbed collector", () => {
         } : {}),
         author: run === 1
           ? { id: "a", screen_name: "alice", name: "Alice" }
-          : { id: "a-new", screen_name: "alice-new", name: "Alice New" },
+          : run === 2
+            ? { id: "a-new", screen_name: "alice-new", name: "Alice New" }
+            : { screen_name: "alice-new" },
       }] }, cursor: { bottom: null } }));
     });
 
@@ -195,6 +197,7 @@ describe("FxEmbed collector", () => {
       views: 30_000,
       media: { photos: [{ type: "photo", url: "https://example.com/growing.jpg" }] },
       possibly_sensitive: true,
+      _counter_presence: { authorId: false, authorName: false },
     });
   });
 
