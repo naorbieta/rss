@@ -1718,6 +1718,33 @@ describe("ChatGPT MCP connector", () => {
     expect(responses.map((response) => response.status).sort()).toEqual([302, 400]);
   });
 
+  it("allows the HTTPS origin for the configured production host", async () => {
+    const clientId = await registerClient();
+    const approved = await approveAuthorization(clientId);
+    const token = await accessToken(clientId, approved.code);
+    const productionEnv = { ...oauthEnv, MCP_ALLOWED_HOST: "curator.example" };
+    const mcpRequest = (origin: string) => new Request("https://localhost/mcp", {
+      method: "POST",
+      headers: {
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        host: "curator.example",
+        origin,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } },
+      }),
+    });
+
+    expect((await worker.fetch(mcpRequest("https://evil.example"), productionEnv)).status).toBe(403);
+    const response = await worker.fetch(mcpRequest("https://curator.example"), productionEnv);
+    expect(response.status).toBe(200);
+  });
+
   it("keeps parallel authorization flows valid in one browser", async () => {
     const clientId = await registerClient();
     const first = await beginAuthorization(clientId);
