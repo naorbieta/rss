@@ -1713,6 +1713,21 @@ describe("ChatGPT MCP connector", () => {
     ]);
     expect(responses.map((response) => response.status).sort()).toEqual([302, 400]);
   });
+
+  it("keeps parallel authorization flows valid in one browser", async () => {
+    const clientId = await registerClient();
+    const first = await beginAuthorization(clientId);
+    const second = await beginAuthorization(clientId);
+    const cookies = new Map<string, string>();
+    for (const cookie of [first.cookie, second.cookie]) {
+      const [name, value] = cookie.split(";", 1)[0].split("=");
+      cookies.set(name, value);
+    }
+    const browserCookie = [...cookies].map(([name, value]) => `${name}=${value}`).join("; ");
+
+    const response = await worker.fetch(approvalRequest({ ...first, cookie: browserCookie }, "test-admin-token"), oauthEnv);
+    expect(response.status).toBe(302);
+  });
 });
 
 describe("candidates", () => {

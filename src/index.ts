@@ -1460,7 +1460,7 @@ async function authorize(request: Request, env: WorkerEnv): Promise<Response> {
   ]);
   const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
   return oauthHtml(`<h1>接続を許可</h1><p><strong>${escapeHtml(clientName)}</strong>（${escapeHtml(redirectOrigin)}）が、推薦候補と検索語の取得、検索語の置換を要求しています。</p><form method="post" action="/approve"><input type="hidden" name="flow" value="${flow}"><input type="hidden" name="csrf" value="${csrf}"><label>管理トークン<input type="password" name="token" required autocomplete="current-password"></label><button type="submit">許可する</button></form>`, 200, {
-    "set-cookie": `oauth_csrf=${csrf}; Path=/approve; Max-Age=${OAUTH_REQUEST_TTL_SECONDS}; HttpOnly; SameSite=Lax${secure}`,
+    "set-cookie": `oauth_csrf_${flow}=${csrf}; Path=/approve; Max-Age=${OAUTH_REQUEST_TTL_SECONDS}; HttpOnly; SameSite=Lax${secure}`,
   });
 }
 
@@ -1492,7 +1492,7 @@ async function approve(request: Request, env: WorkerEnv): Promise<Response> {
     ? (await env.DB.prepare("SELECT value FROM collector_state WHERE key = ? AND updated_at >= ?")
       .bind(stateKey, cutoff).first<{ value: string }>())?.value ?? null
     : null;
-  if (!storedText || !csrf || !await secretsMatch(csrf, cookieValue(request, "oauth_csrf"))) {
+  if (!storedText || !csrf || !await secretsMatch(csrf, cookieValue(request, `oauth_csrf_${flow}`))) {
     return oauthHtml("<h1>接続要求の有効期限が切れました</h1><p>ChatGPTから接続をやり直してください。</p>", 400);
   }
   let parsed: unknown;
