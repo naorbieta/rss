@@ -160,8 +160,8 @@ describe("FxEmbed collector", () => {
           : {};
       return new Response(JSON.stringify({ results: { timeline: [{
         id: "growing",
-        url: "https://x.com/alice/status/growing",
-        text: "伸びた投稿",
+        url: run === 1 ? "https://x.com/alice/status/growing" : "https://x.com/alice-new/status/growing",
+        ...(run === 2 ? { text: "更新後の本文" } : {}),
         created_timestamp: 1_700_000_000,
         ...counters,
         bookmarks: run === 1 ? 40 : 80,
@@ -170,7 +170,9 @@ describe("FxEmbed collector", () => {
           media: { photos: [{ type: "photo", url: "https://example.com/growing.jpg", width: 100, height: 100 }] },
           possibly_sensitive: true,
         } : {}),
-        author: { id: "a", screen_name: "alice", name: "Alice" },
+        author: run === 1
+          ? { id: "a", screen_name: "alice", name: "Alice" }
+          : { id: "a-new", screen_name: "alice-new", name: "Alice New" },
       }] }, cursor: { bottom: null } }));
     });
 
@@ -178,7 +180,12 @@ describe("FxEmbed collector", () => {
     await collectOnce(runtimeEnv, 1_700_000_101_000);
     await collectOnce(runtimeEnv, 1_700_000_102_000);
 
-    const post = await db.prepare("SELECT likes, reposts, quotes, replies, details_json FROM posts WHERE id = ?").bind("growing").first<{ likes: number; reposts: number; quotes: number; replies: number; details_json: string }>();
+    const post = await db.prepare("SELECT url, text, author_id, author_screen_name, author_name, likes, reposts, quotes, replies, details_json FROM posts WHERE id = ?").bind("growing").first<{ url: string; text: string; author_id: string; author_screen_name: string; author_name: string; likes: number; reposts: number; quotes: number; replies: number; details_json: string }>();
+    expect(post?.url).toBe("https://x.com/alice-new/status/growing");
+    expect(post?.text).toBe("更新後の本文");
+    expect(post?.author_id).toBe("a-new");
+    expect(post?.author_screen_name).toBe("alice-new");
+    expect(post?.author_name).toBe("Alice New");
     expect(post?.likes).toBe(125);
     expect(post?.reposts).toBe(15);
     expect(post?.quotes).toBe(8);
