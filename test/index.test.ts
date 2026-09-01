@@ -959,7 +959,7 @@ describe("FxEmbed collector", () => {
     expect((await db.prepare("SELECT handle FROM accounts").all<{ handle: string }>()).results).toEqual([{ handle: "new-account" }]);
   });
 
-  it("resumes account polling after reverting a failed source change", async () => {
+  it("resyncs the original source after reverting a partially saved source change", async () => {
     const timestamp = "2999-01-01T00:00:00.000Z";
     await db.batch([
       db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("old", "old-account", "Old", 1_699_999_900),
@@ -967,14 +967,45 @@ describe("FxEmbed collector", () => {
       db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_cursor", "", timestamp),
       db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_marker", "", timestamp),
       db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_sync_at", timestamp, timestamp),
-      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_pending_source_handle", "failed-source", timestamp),
     ]);
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } })),
-    );
+    let batchCalls = 0;
+    const failingDb = new Proxy(db, {
+      get(target, property) {
+        if (property === "prepare") return target.prepare.bind(target);
+        if (property === "batch") return (statements: D1PreparedStatement[]) => {
+          batchCalls += 1;
+          if (batchCalls === 3) return Promise.reject(new Error("second following chunk failed"));
+          return target.batch(statements);
+        };
+        return Reflect.get(target, property, target);
+      },
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/2/profile/failed-source/following") {
+        return new Response(JSON.stringify({ results: { users: Array.from({ length: 50 }, (_, index) => ({
+          id: `partial-${index}`, screen_name: `partial-${index}`, name: `Partial ${index}`,
+        })) }, cursor: { bottom: null } }));
+      }
+      if (path === "/2/profile/old-source/following") {
+        return new Response(JSON.stringify({ results: { users: [{ id: "old", screen_name: "old-account", name: "Old" }] }, cursor: { bottom: null } }));
+      }
+      if (path === "/2/profile/old-account/statuses") {
+        return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } }));
+      }
+      throw new Error(`unexpected fetch: ${path}`);
+    });
 
-    expect((await collectOnce({ DB: db, SOURCE_HANDLE: "old-source" }, 1_700_000_100_000)).accounts).toBe(1);
-    expect(new URL(String(fetchMock.mock.calls[0][0])).pathname).toBe("/2/profile/old-account/statuses");
+    expect(await collectOnce({ DB: failingDb, SOURCE_HANDLE: "failed-source" }, 1_700_000_100_000)).toEqual({ following: false, accounts: 0, queries: 0 });
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM accounts").first<{ count: number }>())?.count).toBe(21);
+    expect(await collectOnce({ DB: db, SOURCE_HANDLE: "old-source" }, 1_700_000_101_000)).toEqual({ following: true, accounts: 0, queries: 0 });
+    expect((await db.prepare("SELECT handle FROM accounts").all<{ handle: string }>()).results).toEqual([{ handle: "old-account" }]);
+    expect(await collectOnce({ DB: db, SOURCE_HANDLE: "old-source" }, 1_700_000_102_000)).toEqual({ following: false, accounts: 1, queries: 0 });
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
+      "/2/profile/failed-source/following",
+      "/2/profile/old-source/following",
+      "/2/profile/old-account/statuses",
+    ]);
   });
 
   it("treats status 204 as a successful empty check", async () => {

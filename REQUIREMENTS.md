@@ -39,6 +39,6 @@ npx wrangler d1 export rss-curator --local --skip-confirmation --output /tmp/rss
 npx wrangler d1 execute rss-curator-restore --local --config /tmp/rss-curator-restore-wrangler.jsonc --file /tmp/rss-curator-backup.sql
 ```
 
-上記の確認はすべて成功しました。一時 local state へ migration を適用し、同じ D1 エンジンの schema を確認しています。自動テスト68件には、OAuthの認可からMCPの3ツール呼び出しまでの統合確認、同時認可でもstateを一度だけ消費する確認、同じブラウザで並行した認可を維持する確認、未完了認可stateの上限、本番hostの正規Origin許可と悪性Origin拒否、本番の確認用JSON APIをD1アクセス前に拒否する確認、失敗したfollowing設定を戻した際の収集再開、account backlogのcursor循環防止を含みます。FxEmbed の実通信では following 71件を同期し、公開70件の投稿を収集、protected 1件を取得対象外として確認しました。実APIで `count` 指定より多い投稿と `0|` で始まる最終cursorを検出し、分割保存と完了判定へ反映しています。検索語8件も一巡し、ローカルD1には合計1,355投稿を保存しました。実デプロイと remote DB 操作は実行していません。
+上記の確認はすべて成功しました。一時 local state へ migration を適用し、同じ D1 エンジンの schema を確認しています。自動テスト68件には、OAuthの認可からMCPの3ツール呼び出しまでの統合確認、同時認可でもstateを一度だけ消費する確認、同じブラウザで並行した認可を維持する確認、未完了認可stateの上限、本番hostの正規Origin許可と悪性Origin拒否、本番の確認用JSON APIをD1アクセス前に拒否する確認、途中まで保存されたfollowing設定を元へ戻した際の再同期と収集再開、account backlogのcursor循環防止を含みます。FxEmbed の実通信では following 71件を同期し、公開70件の投稿を収集、protected 1件を取得対象外として確認しました。実APIで `count` 指定より多い投稿と `0|` で始まる最終cursorを検出し、分割保存と完了判定へ反映しています。検索語8件も一巡し、ローカルD1には合計1,355投稿を保存しました。実デプロイと remote DB 操作は実行していません。
 
 `/__scheduled` は Wrangler が開発サーバーに提供する入口なので、外部 API を mock できる `test/index.test.ts` で `scheduled` handler を直接呼び出して同じ収集処理を確認しました。手動確認用の URL は README に記載しています。

@@ -946,6 +946,7 @@ function logSourceFailure(source: string, error: unknown): void {
 }
 
 async function shouldSyncFollowing(db: D1Database, sourceHandle: string, nowMs: number): Promise<boolean> {
+  if (await readState(db, FOLLOWING_PENDING_SOURCE_KEY)) return true;
   if (await readState(db, "following_source_handle") !== sourceHandle) return true;
   const cursor = await readState(db, "following_cursor");
   const marker = await readState(db, "following_marker");
