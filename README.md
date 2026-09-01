@@ -59,14 +59,14 @@ Cron 1 回につき、保存済みの巡回位置から検索語を最大 1 件�
 
 ## 収集を動かす
 
-通常は `wrangler.jsonc` の Cron Trigger（15 分ごと）が `scheduled` handler を呼びます。ローカルで手動確認するときは専用収集 route を使わず、次を別のターミナルで実行します。
+通常は `wrangler.jsonc` の Cron Trigger（5 分ごと）が `scheduled` handler を呼びます。ローカルで手動確認するときは専用収集 route を使わず、次を別のターミナルで実行します。
 
 ```sh
 npx wrangler dev --test-scheduled
-curl "http://localhost:8787/__scheduled?cron=*/15+*+*+*+*"
+curl "http://localhost:8787/__scheduled?cron=*/5+*+*+*+*"
 ```
 
-収集全体は実行開始時刻を基準に期限10分のリースで直列化します。重複実行は安全に何もせず、実行プロセスが終了してもリースの期限後に再取得できます。
+収集全体は実行開始時刻を基準に期限4分のリースで直列化します。重複実行は安全に何もせず、実行プロセスが終了してもリースの期限後に再取得できます。
 
 1 回の実行には上限があります。取得は 1 ページ、アカウントは最大 1 件、検索語は最大 1 件です。FxEmbed APIには一覧の `count=50`、status と検索の `count=25` を指定します。following は20件、投稿は6件単位に分け、D1のバインド上限内で保存します。上流がこの件数を超えて返した場合は source 失敗として保存を進めません。取得対象の source handle、cursor、full sync marker、巡回位置、最終同期時刻は `collector_state` に保存します。`SOURCE_HANDLE` を変更した場合は、古い cursor と marker を使わず新しい full sync を開始し、SOURCE_HANDLE変更時または24時間再同期時の full sync が完了するまで保存済みアカウントの status 取得を止めます。空の `SOURCE_HANDLE` では取得と保存済みアカウントの status 取得を止めますが、検索語の収集と保存済みアカウントは維持します。full sync 完了後は24時間待ち、途中の同期だけ毎回1ページ進めます。同期を試みた実行では、成功・失敗にかかわらずアカウントの status 取得を行わず、次回 Cron 以降に回します。新しく見つけたアカウントは発見時刻を開始位置として保存し、full sync 完了後にその時刻以降の status を最終ページまで取得します。同期を行わない実行では、最大1アカウントについて status の cursor なし fresh を先に1ページ取得し、保存済み backlog cursor があれば同じ実行で1ページ進めます。backlog 中は固定した `since` を使い、fresh で新しい cursor が見つかれば待ち行列に保存して現在の backlog 終端後に切り替えます。最後の backlog と待ち行列が終端するまで `last_post_timestamp` は進めません。完了後は最新時刻と同じ秒の既知IDを状態に残し、同じ fresh を backlog として再開しません。protected アカウントは保存しますが、status は取得しません。
 上限値はコードで固定しています。

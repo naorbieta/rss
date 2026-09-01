@@ -127,8 +127,8 @@ const MAX_OAUTH_BODY_BYTES = 4 * 1024;
 const MAX_CANDIDATE_LIMIT = 50;
 const MAX_CANDIDATE_HOURS = 24;
 const FOLLOWING_RESYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
-// No-following runs make at most 4 upstream requests (1 account + 1 query, each fresh/backlog), so 40 seconds at timeout; the 10-minute lease is ample and below the 15-minute Cron interval.
-const COLLECTION_LEASE_MS = 10 * 60 * 1000;
+// No-following runs make at most 4 upstream requests (1 account + 1 query, each fresh/backlog), so 40 seconds at timeout; the 4-minute lease is ample and below the 5-minute Cron interval.
+const COLLECTION_LEASE_MS = 4 * 60 * 1000;
 const ACCOUNT_STATUS_STATE_PREFIX = "account_status:";
 const SEARCH_QUERY_STATE_PREFIX = "search_query:";
 const FOLLOWING_PENDING_SOURCE_KEY = "following_pending_source_handle";

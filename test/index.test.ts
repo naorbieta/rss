@@ -1469,8 +1469,8 @@ describe("FxEmbed collector", () => {
     const leaseReadAt = Date.now();
     const lease = await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("collection_lease").first<{ value: string }>();
     const leaseExpiresAt = Number(lease?.value.split(":", 1)[0]);
-    expect(leaseExpiresAt).toBeGreaterThan(leaseReadAt + 8 * 60 * 1000);
-    expect(leaseExpiresAt).toBeLessThan(leaseReadAt + 12 * 60 * 1000);
+    expect(leaseExpiresAt).toBeGreaterThan(leaseReadAt + 3 * 60 * 1000);
+    expect(leaseExpiresAt).toBeLessThan(leaseReadAt + 5 * 60 * 1000);
 
     releaseFollowing();
     expect(await firstRun).toEqual({ following: true, accounts: 0, queries: 0 });
@@ -1511,7 +1511,7 @@ describe("FxEmbed collector", () => {
     await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("scheduled").run();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ code: 200, results: { timeline: [] }, cursor: { bottom: null } })));
 
-    await worker.scheduled({ scheduledTime: 1_700_000_100_000, cron: "*/15 * * * *", noRetry() {} }, adminRuntimeEnv);
+    await worker.scheduled({ scheduledTime: 1_700_000_100_000, cron: "*/5 * * * *", noRetry() {} }, adminRuntimeEnv);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE query = ?").bind("scheduled").first<{ last_checked_at: string }>())?.last_checked_at).toBe("2023-11-14T22:15:00.000Z");
