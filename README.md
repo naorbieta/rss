@@ -21,6 +21,21 @@ SOURCE_HANDLE=your_handle
 
 Workersへ配置するときは、同じ名前の `ADMIN_TOKEN` を Workers Secret として設定します。平文の `vars` には置きません。Wrangler の設定値を変更したら `npm run types` をもう一度実行してください。
 
+## 本番へ配置する前に
+
+`wrangler.jsonc` の `database_id` はローカル用の仮のIDです。本番用の新しいD1を作る場合は、次の準備をしてから配置します。
+
+```sh
+npx wrangler d1 create rss-curator
+# 表示された database_id を wrangler.jsonc に設定する
+npx wrangler d1 migrations apply rss-curator --remote
+npx wrangler secret put ADMIN_TOKEN
+# wrangler.jsonc の vars.SOURCE_HANDLE に対象アカウントを設定する
+npx wrangler deploy
+```
+
+既存のリモートD1を使う場合は、先にexportなどでバックアップを取得して内容を確認してから、`migrations apply --remote` を実行してください。
+
 ## 検索語を管理する
 
 `GET /queries` は現在有効な検索語を返します。`PUT /queries` は有効な検索語全体を置き換えます。どちらも `ADMIN_TOKEN` が必要です。

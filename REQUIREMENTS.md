@@ -15,7 +15,7 @@
 | 9. 反応ゼロ級の一般検索結果を推薦候補から除く | `GET /candidates`、`requiredLikes` | 経過時間に応じた最低反応数、following の緩和、ブックマーク数による通過を上限適用前に判定し、適格候補が脱落しないことを確認 |
 | 10. 保存したくなる投稿形式を候補順位へ反映 | `candidateFor`、`candidates` | 画像、引用、具体的な長文の signal と順位、media の返却、安定した作者ID・取得元を1件ずつ先に出す分散を確認 |
 | 11. 投稿を再取得時に更新 | `postsStatements` の upsert | 本文・URL・作者情報と明示された反応数の減少を反映し、次の取得で省略された本文・反応数・画像・センシティブ判定を保持することを確認 |
-| 12. 有料 API・有料サービスなし | FxEmbed 公開 API、D1、Cron のみ | `package.json` の開発依存だけを確認、deploy 非実行 |
+| 12. 有料 API・有料サービスなし | FxEmbed 公開 API、D1、Cron のみ | `package.json` の開発依存、本番D1 IDの設定手順を確認、deploy 非実行 |
 
 ## 実行した確認
 
