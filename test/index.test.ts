@@ -1564,7 +1564,7 @@ describe("ChatGPT MCP connector", () => {
     return ((await response.json()) as { client_id: string }).client_id;
   }
 
-  async function beginAuthorization(clientId: string): Promise<{ flow: string; csrf: string; cookie: string }> {
+  async function authorizationRequest(clientId: string): Promise<Request> {
     const url = new URL("https://localhost/authorize");
     url.search = new URLSearchParams({
       response_type: "code",
@@ -1576,7 +1576,11 @@ describe("ChatGPT MCP connector", () => {
       scope: "mcp",
       resource: "https://localhost/mcp",
     }).toString();
-    const response = await worker.fetch(new Request(url), oauthEnv);
+    return new Request(url);
+  }
+
+  async function beginAuthorization(clientId: string): Promise<{ flow: string; csrf: string; cookie: string }> {
+    const response = await worker.fetch(await authorizationRequest(clientId), oauthEnv);
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
     const html = await response.text();
@@ -1727,6 +1731,19 @@ describe("ChatGPT MCP connector", () => {
 
     const response = await worker.fetch(approvalRequest({ ...first, cookie: browserCookie }, "test-admin-token"), oauthEnv);
     expect(response.status).toBe(302);
+  });
+
+  it("bounds pending authorization state", async () => {
+    const clientId = await registerClient();
+    const statuses: number[] = [];
+    for (let index = 0; index < 25; index += 1) {
+      statuses.push((await worker.fetch(await authorizationRequest(clientId), oauthEnv)).status);
+    }
+
+    const count = await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key LIKE ?")
+      .bind("oauth_request:%").first<{ count: number }>();
+    expect(statuses).toEqual([...Array(20).fill(200), ...Array(5).fill(429)]);
+    expect(count?.count).toBe(20);
   });
 });
 

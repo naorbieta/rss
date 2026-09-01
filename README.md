@@ -138,6 +138,8 @@ npx @modelcontextprotocol/inspector@latest
 
 Inspectorに `http://127.0.0.1:8787/mcp` を指定し、OAuthの認可画面で `.dev.vars` の `ADMIN_TOKEN` を入力します。3ツールの一覧表示と呼び出しを確認してください。
 
+未完了の認可要求は全体で20件まで保持します。上限を超えると429を返すため、開いている認可を完了するか、10分後にやり直してください。
+
 ChatGPTから利用するには、Workerを配置して公開HTTPS URLを用意します。ChatGPTの「設定」→「Security and login」でDeveloper modeを有効にし、[ChatGPT Plugins](https://chatgpt.com/plugins) の追加ボタンから `https://<WorkerのURL>/mcp` を登録します。表示された認可画面に `ADMIN_TOKEN` を入力し、新しい会話のツールメニューでこの接続を有効にします。Developer modeの利用可否はアカウントやワークスペースの設定に依存します。詳しい画面手順は[OpenAI公式の接続手順](https://developers.openai.com/plugins/deploy/connect-chatgpt)を参照してください。
 
 `ADMIN_TOKEN` はWorkerの認可画面だけに入力し、会話本文へは貼り付けません。会話では、たとえば次のように依頼できます。

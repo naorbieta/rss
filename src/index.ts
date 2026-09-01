@@ -135,6 +135,7 @@ const FOLLOWING_PENDING_SOURCE_KEY = "following_pending_source_handle";
 const COLLECTION_LEASE_KEY = "collection_lease";
 const OAUTH_REQUEST_PREFIX = "oauth_request:";
 const OAUTH_REQUEST_TTL_SECONDS = 10 * 60;
+const MAX_PENDING_OAUTH_REQUESTS = 20;
 const MCP_SCOPES = ["mcp"];
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -1450,14 +1451,25 @@ async function authorize(request: Request, env: WorkerEnv): Promise<Response> {
   const csrf = crypto.randomUUID();
   const now = new Date();
   const cutoff = new Date(now.getTime() - OAUTH_REQUEST_TTL_SECONDS * 1000).toISOString();
-  await env.DB.batch([
+  const [, inserted] = await env.DB.batch([
     env.DB.prepare("DELETE FROM collector_state WHERE key LIKE ? AND updated_at < ?").bind(`${OAUTH_REQUEST_PREFIX}%`, cutoff),
-    env.DB.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind(
+    env.DB.prepare(`
+      INSERT INTO collector_state (key, value, updated_at)
+      SELECT ?, ?, ?
+      WHERE (SELECT COUNT(*) FROM collector_state WHERE key LIKE ?) < ?
+    `).bind(
       `${OAUTH_REQUEST_PREFIX}${flow}`,
       JSON.stringify({ request: oauthRequest, csrf, clientName }),
       now.toISOString(),
+      `${OAUTH_REQUEST_PREFIX}%`,
+      MAX_PENDING_OAUTH_REQUESTS,
     ),
   ]);
+  if (inserted.meta.changes === 0) {
+    return oauthHtml("<h1>接続要求が多すぎます</h1><p>開いている接続を完了するか、10分後にやり直してください。</p>", 429, {
+      "retry-after": String(OAUTH_REQUEST_TTL_SECONDS),
+    });
+  }
   const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
   return oauthHtml(`<h1>接続を許可</h1><p><strong>${escapeHtml(clientName)}</strong>（${escapeHtml(redirectOrigin)}）が、推薦候補と検索語の取得、検索語の置換を要求しています。</p><form method="post" action="/approve"><input type="hidden" name="flow" value="${flow}"><input type="hidden" name="csrf" value="${csrf}"><label>管理トークン<input type="password" name="token" required autocomplete="current-password"></label><button type="submit">許可する</button></form>`, 200, {
     "set-cookie": `oauth_csrf_${flow}=${csrf}; Path=/approve; Max-Age=${OAUTH_REQUEST_TTL_SECONDS}; HttpOnly; SameSite=Lax${secure}`,
