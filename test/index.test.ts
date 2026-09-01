@@ -1500,6 +1500,42 @@ describe("feed", () => {
     const response = await worker.fetch(new Request("https://localhost/feed?page=0&limit=101"), env);
     expect(response.status).toBe(400);
   });
+
+  it("protects production feed and candidates before querying D1", async () => {
+    const tracked = countD1Queries(db);
+    const productionEnv = {
+      ...env,
+      DB: tracked.db,
+      ADMIN_TOKEN: "test-admin-token",
+      MCP_ALLOWED_HOST: "curator.example",
+    };
+
+    for (const path of ["/feed", "/candidates"]) {
+      const missing = await worker.fetch(new Request(`https://curator.example${path}`), productionEnv);
+      expect(missing.status).toBe(401);
+      expect(missing.headers.get("www-authenticate")).toBe('Bearer realm="diagnostics"');
+
+      const wrong = await worker.fetch(new Request(`https://curator.example${path}`, {
+        headers: { authorization: "Bearer wrong-token" },
+      }), productionEnv);
+      expect(wrong.status).toBe(401);
+    }
+    expect(tracked.queries).toHaveLength(0);
+
+    for (const path of ["/feed", "/candidates"]) {
+      const response = await worker.fetch(new Request(`https://curator.example${path}`, {
+        headers: { authorization: "Bearer test-admin-token" },
+      }), productionEnv);
+      expect(response.status).toBe(200);
+    }
+    expect(tracked.queries).toHaveLength(2);
+
+    const misconfigured = await worker.fetch(new Request("https://curator.example/feed"), {
+      ...productionEnv,
+      ADMIN_TOKEN: "",
+    });
+    expect(misconfigured.status).toBe(500);
+  });
 });
 
 describe("ChatGPT MCP connector", () => {

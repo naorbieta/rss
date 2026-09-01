@@ -1044,6 +1044,18 @@ async function hasAdminAccess(request: Request, expectedToken: string): Promise<
   return secretsMatch(providedToken, expectedToken);
 }
 
+async function productionReadAccessError(request: Request, env: WorkerEnv): Promise<Response | null> {
+  if (!env.MCP_ALLOWED_HOST.trim()) return null;
+  if (!env.ADMIN_TOKEN) {
+    console.error(JSON.stringify({ event: "configuration_error", binding: "ADMIN_TOKEN" }));
+    return json({ error: "configuration_error", message: "ADMIN_TOKEN が設定されていません" }, 500);
+  }
+  if (await hasAdminAccess(request, env.ADMIN_TOKEN)) return null;
+  return json({ error: "unauthorized", message: "有効な Bearer token を指定してください" }, 401, {
+    "www-authenticate": 'Bearer realm="diagnostics"',
+  });
+}
+
 async function readBoundedBody(request: Request, maxBytes = MAX_QUERY_BODY_BYTES): Promise<Uint8Array | null> {
   if (!request.body) return new Uint8Array();
   const reader = request.body.getReader();
@@ -1518,8 +1530,11 @@ async function approve(request: Request, env: WorkerEnv): Promise<Response> {
 async function appFetch(request: Request, env: WorkerEnv): Promise<Response> {
   try {
     const url = new URL(request.url);
-    if (request.method === "GET" && url.pathname === "/feed") return await feed(request, env);
-    if (request.method === "GET" && url.pathname === "/candidates") return await candidates(request, env);
+    if (request.method === "GET" && (url.pathname === "/feed" || url.pathname === "/candidates")) {
+      const accessError = await productionReadAccessError(request, env);
+      if (accessError) return accessError;
+      return url.pathname === "/feed" ? await feed(request, env) : await candidates(request, env);
+    }
     if (url.pathname === "/queries") return await manageQueries(request, env);
     if (request.method === "GET" && url.pathname === "/authorize") return await authorize(request, env);
     if (request.method === "POST" && url.pathname === "/approve") return await approve(request, env);

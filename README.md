@@ -12,7 +12,7 @@ npm run types
 npx wrangler d1 migrations apply rss-curator --local
 ```
 
-検索語の変更APIは `ADMIN_TOKEN` で保護します。ローカルでは `.dev.vars` に推測されにくい値を設定します。このファイルは Git に入りません。`SOURCE_HANDLE` は空文字のままでも検索語の収集だけを利用できます。
+検索語の変更APIと本番環境の確認用JSON APIは `ADMIN_TOKEN` で保護します。ローカルでは `.dev.vars` に推測されにくい値を設定します。このファイルは Git に入りません。`SOURCE_HANDLE` は空文字のままでも検索語の収集だけを利用できます。
 
 ```text
 ADMIN_TOKEN=推測されにくい値
@@ -78,6 +78,8 @@ D1 Free の1回の Worker invocation あたりのクエリ上限は50です（[C
 ```sh
 curl "http://localhost:8787/feed?page=1&limit=100&hours=24"
 ```
+
+ローカルの `/feed` と `/candidates` はそのまま確認できます。`MCP_ALLOWED_HOST` を設定した本番環境では、両方とも `Authorization: Bearer <ADMIN_TOKEN>` が必要です。ChatGPTはこれらを直接使わず、OAuthで保護した `/mcp` を使います。
 
 `page` は 1 以上、`limit` は 1〜100、`hours` は正の数です。`hours` の既定値は 24 です。返却形式は `generated_at`、ページ情報、`posts` の envelope で、投稿の `created_at` は ISO 8601 文字列、`quote` は引用がなければ `null`、あれば JSON object です。投稿は投稿日時の降順（同時刻は ID の降順）で返します。
 
