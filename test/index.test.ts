@@ -1575,6 +1575,22 @@ describe("candidates", () => {
     expect(response.status).toBe(400);
   });
 
+  it("limits candidate hours before querying D1 while leaving feed hours unrestricted", async () => {
+    const tracked = countD1Queries(db);
+    for (const hours of ["0", "24.0001", "1000000", "Infinity", "NaN"]) {
+      const response = await worker.fetch(new Request(`https://localhost/candidates?hours=${hours}`), { ...env, DB: tracked.db });
+      expect(response.status).toBe(400);
+    }
+    expect(tracked.queries).toHaveLength(0);
+
+    const candidatesAtLimit = await worker.fetch(new Request("https://localhost/candidates?hours=24"), env);
+    expect(candidatesAtLimit.status).toBe(200);
+
+    const feed = await worker.fetch(new Request("https://localhost/feed?hours=48"), env);
+    expect(feed.status).toBe(200);
+    expect((await feed.json() as { hours: number }).hours).toBe(48);
+  });
+
   it("uses stable author IDs for diversity after a handle change", async () => {
     const now = Math.floor(Date.now() / 1000);
     const collectedAt = new Date(now * 1000).toISOString();

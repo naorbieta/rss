@@ -104,6 +104,7 @@ const MAX_MANAGED_QUERIES = 20;
 const MAX_QUERY_LENGTH = 200;
 const MAX_QUERY_BODY_BYTES = 32 * 1024;
 const MAX_CANDIDATE_LIMIT = 50;
+const MAX_CANDIDATE_HOURS = 24;
 const FOLLOWING_RESYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // No-following runs make at most 4 upstream requests (1 account + 1 query, each fresh/backlog), so 40 seconds at timeout; the 10-minute lease is ample and below the 15-minute Cron interval.
 const COLLECTION_LEASE_MS = 10 * 60 * 1000;
@@ -1238,8 +1239,8 @@ export async function candidates(request: Request, env: RuntimeEnv): Promise<Res
   const limitValue = url.searchParams.get("limit") ?? "20";
   const limit = /^\d+$/.test(limitValue) ? Number(limitValue) : NaN;
   const hours = parsePositiveNumber(url.searchParams.get("hours"), 24);
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_CANDIDATE_LIMIT || hours === null) {
-    return json({ error: "invalid_query", message: `limit は1〜${MAX_CANDIDATE_LIMIT}、hours は0より大きい数を指定してください` }, 400);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_CANDIDATE_LIMIT || hours === null || hours > MAX_CANDIDATE_HOURS) {
+    return json({ error: "invalid_query", message: `limit は1〜${MAX_CANDIDATE_LIMIT}、hours は0より大きく${MAX_CANDIDATE_HOURS}以下を指定してください` }, 400);
   }
 
   const generatedAtMs = Date.now();
