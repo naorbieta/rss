@@ -1606,7 +1606,7 @@ describe("candidates", () => {
     expect(body.posts.map((post) => post.author.id)).toEqual(["stable-author", "other-author"]);
   });
 
-  it("keeps a bookmark-qualified post inside the bounded candidate scan", async () => {
+  it("keeps a bookmark-qualified post among all eligible rows", async () => {
     const now = Math.floor(Date.now() / 1000);
     const createdTimestamp = now - 23 * 3600;
     const collectedAt = new Date(now * 1000).toISOString();
@@ -1651,7 +1651,7 @@ describe("candidates", () => {
     expect(body.posts[0]).toMatchObject({ id: "bookmark-qualified", bookmarks: 100 });
   });
 
-  it("keeps a format-rich candidate when plain eligible rows fill the scan", async () => {
+  it("keeps a format-rich candidate when all eligible rows are scored", async () => {
     const now = Math.floor(Date.now() / 1000);
     const createdTimestamp = now - 23 * 3600;
     const collectedAt = new Date(now * 1000).toISOString();
@@ -1692,7 +1692,7 @@ describe("candidates", () => {
     expect(body.posts[0].selection.signals).toEqual(expect.arrayContaining(["media", "quote", "detailed"]));
   });
 
-  it("keeps a following-qualified post when ineligible search rows fill the scan", async () => {
+  it("keeps a following-qualified post after SQL eligibility filtering", async () => {
     const now = Math.floor(Date.now() / 1000);
     const createdTimestamp = now - 23 * 3600;
     const collectedAt = new Date(now * 1000).toISOString();
@@ -1737,7 +1737,7 @@ describe("candidates", () => {
     expect(body.posts.map((post) => post.id)).toEqual(["following-qualified"]);
   });
 
-  it("applies the ten-like minimum to recent search rows before the scan limit", async () => {
+  it("applies the ten-like minimum to recent search rows in SQL eligibility", async () => {
     const now = Math.floor(Date.now() / 1000);
     const createdTimestamp = now - 3600;
     const collectedAt = new Date(now * 1000).toISOString();
@@ -1780,6 +1780,46 @@ describe("candidates", () => {
     const body = await response.json() as { evaluated: number; posts: Array<{ id: string }> };
     expect(body.evaluated).toBe(1);
     expect(body.posts.map((post) => post.id)).toEqual(["recent-following-qualified"]);
+  });
+
+  it("preserves author and source diversity after scoring all eligible rows", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const createdTimestamp = now - 23 * 3600;
+    const collectedAt = new Date(now * 1000).toISOString();
+    const insert = (id: string, author: string, sourceKey: string, likes: number) => db.prepare(`INSERT INTO posts
+      (id, url, text, created_timestamp, likes, reposts, quotes, replies, author_id,
+       author_screen_name, author_name, quote_json, details_json, source_kind, source_key, collected_at)
+      VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, NULL, NULL, 'search', ?, ?)`).bind(
+      id,
+      `https://x.com/${author}/status/${id}`,
+      id,
+      createdTimestamp,
+      likes,
+      author,
+      author,
+      author,
+      sourceKey,
+      collectedAt,
+    );
+    await db.batch([
+      ...Array.from({ length: 30 }, (_, index) => insert(`same-author-${index + 1}`, "duplicate-author", `same-author-source-${index + 1}`, 130)),
+      ...Array.from({ length: 30 }, (_, index) => insert(`same-source-${index + 1}`, `same-source-author-${index + 1}`, "same-source", 130)),
+      ...Array.from({ length: 20 }, (_, index) => insert(`diverse-${index + 1}`, `diverse-author-${index + 1}`, `diverse-source-${index + 1}`, 100)),
+    ]);
+
+    const tracked = countD1Queries(db);
+    const response = await worker.fetch(new Request("https://localhost/candidates"), { ...env, DB: tracked.db });
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      evaluated: number;
+      posts: Array<{ id: string; author: { id: string }; source: { key: string } }>;
+    };
+    expect(tracked.queries).toHaveLength(1);
+    expect(body.evaluated).toBe(80);
+    expect(body.posts).toHaveLength(20);
+    expect(new Set(body.posts.map((post) => post.author.id)).size).toBe(20);
+    expect(new Set(body.posts.map((post) => post.source.key)).size).toBe(20);
+    expect(body.posts.filter((post) => post.id.startsWith("diverse-")).length).toBeGreaterThanOrEqual(18);
   });
 });
 

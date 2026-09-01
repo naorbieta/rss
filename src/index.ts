@@ -104,7 +104,6 @@ const MAX_MANAGED_QUERIES = 20;
 const MAX_QUERY_LENGTH = 200;
 const MAX_QUERY_BODY_BYTES = 32 * 1024;
 const MAX_CANDIDATE_LIMIT = 50;
-const MAX_CANDIDATE_SCAN = 1_000;
 const FOLLOWING_RESYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // No-following runs make at most 4 upstream requests (1 account + 1 query, each fresh/backlog), so 40 seconds at timeout; the 10-minute lease is ample and below the 15-minute Cron interval.
 const COLLECTION_LEASE_MS = 10 * 60 * 1000;
@@ -1245,8 +1244,8 @@ export async function candidates(request: Request, env: RuntimeEnv): Promise<Res
 
   const generatedAtMs = Date.now();
   const cutoff = Math.floor((generatedAtMs - hours * 60 * 60 * 1000) / 1000);
-  // ponytail: split bounded preselection across the 8 format masks; exact score and diversity stay in JS.
-  const scanLimit = Math.min(MAX_CANDIDATE_SCAN, Math.max(200, limit * 20));
+  // ponytail: this personal 24h feed scores every eligible row; if Worker memory becomes
+  // a measured problem, replace this with stored scores or pagination.
   const rows = await env.DB.prepare(`
     WITH eligible AS (
       SELECT id, url, text, created_timestamp, likes, reposts, quotes, replies,
@@ -1259,30 +1258,15 @@ export async function candidates(request: Request, env: RuntimeEnv): Promise<Res
         END AS minimum_likes
       FROM posts
       WHERE created_timestamp >= ?
-    ),
-    ranked AS (
-      SELECT eligible.*,
-        ROW_NUMBER() OVER (
-          PARTITION BY
-            CASE WHEN json_type(details_json, '$.media') = 'object' AND json_extract(details_json, '$.media') <> '{}' THEN 1 ELSE 0 END
-            + CASE WHEN json_type(quote_json) = 'object' THEN 2 ELSE 0 END
-            + CASE WHEN length(text) >= 120 THEN 4 ELSE 0 END
-          ORDER BY likes + reposts * 2 + quotes * 3 + bookmarks * 3 DESC,
-            created_timestamp DESC, id DESC
-        ) AS format_rank
-      FROM eligible
-      WHERE likes >= minimum_likes
-        OR bookmarks >= MAX(5, (minimum_likes + 3) / 4)
-        OR (source_kind = 'following' AND likes >= MAX(10, (minimum_likes + 1) / 2))
     )
     SELECT id, url, text, created_timestamp, likes, reposts, quotes, replies,
       author_id, author_screen_name, author_name, quote_json, details_json, source_kind, source_key
-    FROM ranked
-    WHERE format_rank <= ?
-    ORDER BY likes + reposts * 2 + quotes * 3 + bookmarks * 3 DESC,
-      created_timestamp DESC, id DESC
-    LIMIT ?
-  `).bind(generatedAtMs, generatedAtMs, generatedAtMs, cutoff, Math.floor(scanLimit / 8), scanLimit).all<DbFeedRow>();
+    FROM eligible
+    WHERE likes >= minimum_likes
+      OR bookmarks >= MAX(5, (minimum_likes + 3) / 4)
+      OR (source_kind = 'following' AND likes >= MAX(10, (minimum_likes + 1) / 2))
+    ORDER BY created_timestamp DESC, id DESC
+  `).bind(generatedAtMs, generatedAtMs, generatedAtMs, cutoff).all<DbFeedRow>();
   const ranked = rows.results
     .map((row) => candidateFor(row, generatedAtMs))
     .filter((post) => post !== null)
