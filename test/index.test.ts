@@ -737,6 +737,50 @@ describe("FxEmbed collector", () => {
     expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("following_pending_source_handle").first<{ count: number }>())?.count).toBe(0);
   });
 
+  it("seeds new following accounts at discovery and drains their delayed status pages", async () => {
+    const start = 1_700_000_100_000;
+    const baseline = Math.floor(start / 1000);
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(async (input) => {
+        const parsed = new URL(String(input));
+        expect(parsed.pathname).toBe("/2/profile/source/following");
+        expect(parsed.searchParams.get("cursor")).toBeNull();
+        return new Response(JSON.stringify({ results: { users: [{ id: "new", screen_name: "new-account", name: "New" }] }, cursor: { bottom: "following-next" } }));
+      })
+      .mockImplementationOnce(async (input) => {
+        const parsed = new URL(String(input));
+        expect(parsed.pathname).toBe("/2/profile/source/following");
+        expect(parsed.searchParams.get("cursor")).toBe("following-next");
+        return new Response(JSON.stringify({ results: { users: [] }, cursor: { bottom: null } }));
+      })
+      .mockImplementationOnce(async (input) => {
+        const parsed = new URL(String(input));
+        expect(parsed.pathname).toBe("/2/profile/new-account/statuses");
+        expect(parsed.searchParams.get("cursor")).toBeNull();
+        expect(parsed.searchParams.get("since")).toBe(String(baseline));
+        return new Response(JSON.stringify({ results: { timeline: [
+          { id: "newest", url: "https://x.com/new-account/status/newest", text: "新着", created_timestamp: baseline + 60, author: { id: "new", screen_name: "new-account", name: "New" } },
+        ] }, cursor: { bottom: "status-next" } }));
+      })
+      .mockImplementationOnce(async (input) => {
+        const parsed = new URL(String(input));
+        expect(parsed.pathname).toBe("/2/profile/new-account/statuses");
+        expect(parsed.searchParams.get("cursor")).toBe("status-next");
+        expect(parsed.searchParams.get("since")).toBe(String(baseline));
+        return new Response(JSON.stringify({ results: { timeline: [
+          { id: "older", url: "https://x.com/new-account/status/older", text: "過去", created_timestamp: baseline + 30, author: { id: "new", screen_name: "new-account", name: "New" } },
+        ] }, cursor: { bottom: null } }));
+      });
+
+    expect((await collectOnce(accountRuntimeEnv, start)).following).toBe(true);
+    expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("new").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(baseline);
+    expect((await collectOnce(accountRuntimeEnv, start + 15 * 60 * 1000)).following).toBe(true);
+    expect((await collectOnce(accountRuntimeEnv, start + 30 * 60 * 1000)).accounts).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect((await db.prepare("SELECT id FROM posts ORDER BY created_timestamp DESC").all<{ id: string }>()).results.map((post) => post.id)).toEqual(["newest", "older"]);
+    expect((await db.prepare("SELECT last_post_timestamp FROM accounts WHERE id = ?").bind("new").first<{ last_post_timestamp: number }>())?.last_post_timestamp).toBe(baseline + 60);
+  });
+
   it("keeps status polling stopped when a same-source refresh fetch fails", async () => {
     const start = 1_700_000_100_000;
     const previousSync = new Date(start - 25 * 60 * 60 * 1000).toISOString();

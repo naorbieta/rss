@@ -5,7 +5,7 @@
 | 条件 | 実装 | 確認 |
 | --- | --- | --- |
 | 1. following を cursor 分割同期 | `syncFollowingPage`（`/2/profile/{handle}/following`） | pathname、cursor 2 ページ、D1 local migration |
-| 2. 保存済みアカウントを since 収集、返信を除外 | `collectAccountStatuses`、`normalizeStatus` | `since`、`with_replies` 未指定、返信除外、204成功と時刻更新、`retweets`→`reposts`、fresh先行・固定sinceのstatus cursor、queued cursorの切替、初回履歴抑止、同秒IDを含むidle watermark、失敗時保持を確認 |
+| 2. 保存済みアカウントを since 収集、返信を除外 | `collectAccountStatuses`、`normalizeStatus` | `since`、`with_replies` 未指定、返信除外、204成功と時刻更新、`retweets`→`reposts`、fresh先行・固定sinceのstatus cursor、queued cursorの切替、新規アカウントの発見時刻からの複数ページ取得、既存NULL時の初回履歴抑止、同秒IDを含むidle watermark、失敗時保持を確認 |
 | 3. enabled query を latest 収集 | `collectSearchQueries`、`saveSearchLatest`、`saveSearchBacklog` | cursorなしの latest と backlog cursor を毎回別取得、空404成功、検索語ごとの cursor 継続・query変更時リセット、backlog中の新着 cursor を `queued_cursor` に保持して切替、latest 成功時の `last_checked_at`、stop watermarkと同秒IDの境界での backlog 終了、成功可否に依存しない巡回位置を確認 |
 | 4. 投稿 ID 主キー、quote・画像・反応詳細を保存 | migration の `posts.id`、`postsStatements`、`details_json` | following/searchの同一ID 1件保存、`quote_json`、画像、表示数、ブックマーク数、6件単位の分割保存を確認 |
 | 5. Cron、checkpoint、実行上限 | `scheduled`、`collectOnce`、`collector_state` | Cron、scheduled handler、24時間再同期、SOURCE_HANDLE変更時・24時間再同期の再開とfull sync完了前status停止、空SOURCE_HANDLE時のstatus停止、status/query の巡回、失敗batchの巡回、following=50・status/search=25の上流count検証、accounts=1・queries=1、`0|`最終cursor、収集全体の期限付きリースによる重複実行の直列化と期限復帰、D1 Free 50クエリ内、typecheck、Vitest |

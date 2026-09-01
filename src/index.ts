@@ -727,12 +727,13 @@ export async function syncFollowingPage(db: D1Database, sourceHandle: string, no
   const body = await fetchApi(`${API_BASE}/2/profile/${encodeURIComponent(sourceHandle)}/following?${query}`, "following");
   const page = normalizeFollowingPage(body);
   if (page.accounts.length > FOLLOWING_API_COUNT) throw new Error(`following: upstream returned more than ${FOLLOWING_API_COUNT} accounts`);
+  const discoveryBaseline = Math.floor(nowMs / 1000);
   for (let offset = 0; offset < page.accounts.length; offset += FOLLOWING_DB_CHUNK) {
     const accounts = page.accounts.slice(offset, offset + FOLLOWING_DB_CHUNK);
     const accountIdentityValues = accounts.flatMap((account) => [account.id, account.handle]);
     const accountValues = accounts.flatMap((account) => [account.id, account.handle, account.name, account.protected ? 1 : 0, marker]);
     const accountIdentityRows = accounts.map(() => "(?, ?)").join(", ");
-    const accountRows = accounts.map(() => "(?, ?, ?, ?, ?)").join(", ");
+    const accountRows = accounts.map(() => `(?, ?, ?, ?, ?, ${discoveryBaseline})`).join(", ");
     await db.batch([
       db.prepare(`
         WITH incoming(id, handle) AS (VALUES ${accountIdentityRows})
@@ -745,7 +746,7 @@ export async function syncFollowingPage(db: D1Database, sourceHandle: string, no
         )
       `).bind(...accountIdentityValues),
       db.prepare(`
-        INSERT INTO accounts (id, handle, name, protected, sync_marker) VALUES ${accountRows}
+        INSERT INTO accounts (id, handle, name, protected, sync_marker, last_post_timestamp) VALUES ${accountRows}
         ON CONFLICT(id) DO UPDATE SET handle = excluded.handle, name = excluded.name,
           protected = excluded.protected, sync_marker = excluded.sync_marker
       `).bind(...accountValues),
