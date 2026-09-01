@@ -1262,12 +1262,12 @@ export async function candidates(request: Request, env: RuntimeEnv): Promise<Res
   const sources = new Set<string>();
   for (const post of ranked) {
     const source = `${post.source.kind}:${post.source.key}`;
-    if (authors.has(post.author.screen_name) || sources.has(source)) {
+    if (authors.has(post.author.id) || sources.has(source)) {
       deferred.push(post);
       continue;
     }
     selected.push(post);
-    authors.add(post.author.screen_name);
+    authors.add(post.author.id);
     sources.add(source);
     if (selected.length === limit) break;
   }

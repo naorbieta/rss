@@ -1565,6 +1565,37 @@ describe("candidates", () => {
     expect(response.status).toBe(400);
   });
 
+  it("uses stable author IDs for diversity after a handle change", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const collectedAt = new Date(now * 1000).toISOString();
+    const insert = (id: string, author: string, authorId: string, likes: number, sourceKey: string) => db.prepare(`INSERT INTO posts
+      (id, url, text, created_timestamp, likes, reposts, quotes, author_id, author_screen_name,
+       author_name, quote_json, details_json, source_kind, source_key, collected_at)
+      VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, NULL, NULL, 'search', ?, ?)`).bind(
+      id,
+      `https://x.com/${author}/status/${id}`,
+      id,
+      now - 12 * 3600,
+      likes,
+      authorId,
+      author,
+      author,
+      sourceKey,
+      collectedAt,
+    );
+    await db.batch([
+      insert("handle-before", "alice-old", "stable-author", 300, "query-before"),
+      insert("handle-after", "alice-new", "stable-author", 250, "query-after"),
+      insert("other-author", "bob", "other-author", 100, "query-other"),
+    ]);
+
+    const response = await worker.fetch(new Request("https://localhost/candidates?hours=24&limit=2"), env);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { posts: Array<{ id: string; author: { id: string } }> };
+    expect(body.posts.map((post) => post.id)).toEqual(["handle-before", "other-author"]);
+    expect(body.posts.map((post) => post.author.id)).toEqual(["stable-author", "other-author"]);
+  });
+
   it("keeps a bookmark-qualified post inside the bounded candidate scan", async () => {
     const now = Math.floor(Date.now() / 1000);
     const createdTimestamp = now - 23 * 3600;
