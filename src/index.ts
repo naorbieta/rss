@@ -418,7 +418,11 @@ function postsStatements(
         quotes = MAX(posts.quotes, excluded.quotes),
         replies = MAX(posts.replies, excluded.replies),
         quote_json = COALESCE(excluded.quote_json, posts.quote_json),
-        details_json = COALESCE(excluded.details_json, posts.details_json),
+        details_json = CASE
+          WHEN excluded.details_json IS NULL THEN posts.details_json
+          WHEN posts.details_json IS NULL THEN excluded.details_json
+          ELSE json_patch(posts.details_json, excluded.details_json)
+        END,
         source_kind = CASE WHEN excluded.source_kind = 'following' THEN excluded.source_kind ELSE posts.source_kind END,
         source_key = CASE WHEN excluded.source_kind = 'following' THEN excluded.source_key ELSE posts.source_key END,
         collected_at = excluded.collected_at
@@ -1201,14 +1205,15 @@ export async function candidates(request: Request, env: RuntimeEnv): Promise<Res
 
   const generatedAtMs = Date.now();
   const cutoff = Math.floor((generatedAtMs - hours * 60 * 60 * 1000) / 1000);
-  // ponytail: scan the strongest 1,000 rows; move JSON-aware scoring into SQL only if daily volume hides candidates.
+  // ponytail: scan the strongest 1,000 engagement-ranked rows; move full scoring into SQL only if daily volume hides candidates.
   const scanLimit = Math.min(MAX_CANDIDATE_SCAN, Math.max(200, limit * 20));
   const rows = await env.DB.prepare(`
     SELECT id, url, text, created_timestamp, likes, reposts, quotes, replies,
       author_id, author_screen_name, author_name, quote_json, details_json, source_kind, source_key
     FROM posts
     WHERE created_timestamp >= ?
-    ORDER BY (likes + reposts * 2 + quotes * 3) DESC, created_timestamp DESC, id DESC
+    ORDER BY (likes + reposts * 2 + quotes * 3 + COALESCE(CAST(json_extract(details_json, '$.bookmarks') AS INTEGER), 0) * 3) DESC,
+      created_timestamp DESC, id DESC
     LIMIT ?
   `).bind(cutoff, scanLimit).all<DbFeedRow>();
   const ranked = rows.results

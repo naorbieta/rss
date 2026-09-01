@@ -160,9 +160,12 @@ describe("FxEmbed collector", () => {
         created_timestamp: 1_700_000_000,
         likes: run === 1 ? 1 : 250,
         reposts: run === 1 ? 0 : 30,
-        bookmarks: run === 1 ? 0 : 80,
+        bookmarks: run === 1 ? 40 : 80,
         views: run === 1 ? 10 : 20_000,
-        media: { photos: [{ type: "photo", url: "https://example.com/growing.jpg", width: 100, height: 100 }] },
+        ...(run === 1 ? {
+          media: { photos: [{ type: "photo", url: "https://example.com/growing.jpg", width: 100, height: 100 }] },
+          possibly_sensitive: true,
+        } : {}),
         author: { id: "a", screen_name: "alice", name: "Alice" },
       }] }, cursor: { bottom: null } }));
     });
@@ -173,7 +176,12 @@ describe("FxEmbed collector", () => {
     const post = await db.prepare("SELECT likes, reposts, details_json FROM posts WHERE id = ?").bind("growing").first<{ likes: number; reposts: number; details_json: string }>();
     expect(post?.likes).toBe(250);
     expect(post?.reposts).toBe(30);
-    expect(JSON.parse(post?.details_json ?? "null")).toMatchObject({ bookmarks: 80, views: 20_000 });
+    expect(JSON.parse(post?.details_json ?? "null")).toMatchObject({
+      bookmarks: 80,
+      views: 20_000,
+      media: { photos: [{ type: "photo", url: "https://example.com/growing.jpg" }] },
+      possibly_sensitive: true,
+    });
   });
 
   it("excludes account replies but keeps search replies and checkpoints each source", async () => {
@@ -1504,6 +1512,51 @@ describe("candidates", () => {
   it("rejects invalid candidate limits", async () => {
     const response = await worker.fetch(new Request("https://localhost/candidates?limit=51"), env);
     expect(response.status).toBe(400);
+  });
+
+  it("keeps a bookmark-qualified post inside the bounded candidate scan", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const createdTimestamp = now - 23 * 3600;
+    const collectedAt = new Date(now * 1000).toISOString();
+    await db.prepare(`WITH RECURSIVE noise(n) AS (
+      SELECT 1
+      UNION ALL
+      SELECT n + 1 FROM noise WHERE n < 200
+    )
+    INSERT INTO posts
+      (id, url, text, created_timestamp, likes, reposts, quotes, replies, author_id,
+       author_screen_name, author_name, quote_json, details_json, source_kind, source_key, collected_at)
+    SELECT
+      'noise-' || n, 'https://x.com/noise/status/' || n, 'ノイズ', ?, 10, 0, 0, 0,
+      'noise', 'noise', 'Noise', NULL, NULL, 'search', 'noise query', ?
+    FROM noise`).bind(createdTimestamp, collectedAt).run();
+    await db.prepare(`INSERT INTO posts
+      (id, url, text, created_timestamp, likes, reposts, quotes, replies, author_id,
+       author_screen_name, author_name, quote_json, details_json, source_kind, source_key, collected_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      "bookmark-qualified",
+      "https://x.com/alice/status/bookmark-qualified",
+      "保存されそうな投稿",
+      createdTimestamp,
+      0,
+      0,
+      0,
+      0,
+      "a",
+      "alice",
+      "Alice",
+      null,
+      JSON.stringify({ bookmarks: 100 }),
+      "search",
+      "bookmark query",
+      collectedAt,
+    ).run();
+
+    const response = await worker.fetch(new Request("https://localhost/candidates?hours=24&limit=1"), env);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { posts: Array<{ id: string; bookmarks: number | null }> };
+    expect(body.posts).toHaveLength(1);
+    expect(body.posts[0]).toMatchObject({ id: "bookmark-qualified", bookmarks: 100 });
   });
 });
 
