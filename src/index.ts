@@ -1562,9 +1562,9 @@ const mcpApiHandler = {
     if (new URL(request.url).pathname !== "/mcp") return json({ error: "not_found" }, 404);
     const configuredHost = env.MCP_ALLOWED_HOST.trim().toLowerCase();
     const allowedHostnames = configuredHost ? [configuredHost] : localhostAllowedHostnames();
-    const allowedOrigins = configuredHost ? [configuredHost] : localhostAllowedOrigins();
+    const allowedOriginHostnames = configuredHost ? [configuredHost] : localhostAllowedOrigins();
     const rejected = hostHeaderValidationResponse(request, allowedHostnames)
-      ?? originValidationResponse(request, allowedOrigins);
+      ?? originValidationResponse(request, allowedOriginHostnames);
     if (rejected) return rejected;
     return createMcpHandler(() => createCuratorMcpServer(env)).fetch(request);
   },
