@@ -12,9 +12,9 @@
 | 6. `/feed` の pagination・hours・ISO・降順 | `feed` | `generated_at` / `posts`、ページング、hours、`created_at`、ID同率順、quote、media、不正paginationを確認 |
 | 7. ChatGPT 向け安定 JSON | `feed` の `generated_at` / `posts` envelope | Worker fetch の JSON テスト、README の payload 例 |
 | 8. Workers 上で会話から検索語を確認・置換 | `GET /queries`、`PUT /queries`、Workers Secret の `ADMIN_TOKEN` | 未認証401、認証済み一覧取得、全置換、空配列による全停止、重複・過大入力の拒否、D1への反映を確認 |
-| 9. 反応ゼロ級の一般検索結果を推薦候補から除く | `GET /candidates`、`requiredLikes` | 経過時間に応じた最低反応数、following の緩和、ブックマーク数による通過と事前抽出からの脱落防止を確認 |
+| 9. 反応ゼロ級の一般検索結果を推薦候補から除く | `GET /candidates`、`requiredLikes` | 経過時間に応じた最低反応数、following の緩和、ブックマーク数による通過を上限適用前に判定し、適格候補が脱落しないことを確認 |
 | 10. 保存したくなる投稿形式を候補順位へ反映 | `candidateFor`、`candidates` | 画像、引用、具体的な長文の signal と順位、media の返却、作者・取得元を1件ずつ先に出す分散を確認 |
-| 11. 伸びた投稿の反応数を再取得時に更新 | `postsStatements` の upsert | 初回1いいねの投稿が再取得後250いいね、ブックマーク80へ更新され、省略された画像・センシティブ判定は保持されることを確認 |
+| 11. 投稿の反応数を再取得時に更新 | `postsStatements` の upsert | 明示された反応数の減少を反映し、次の取得で省略された反応数と、画像・センシティブ判定を保持することを確認 |
 | 12. 有料 API・有料サービスなし | FxEmbed 公開 API、D1、Cron のみ | `package.json` の開発依存だけを確認、deploy 非実行 |
 
 ## 実行した確認

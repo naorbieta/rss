@@ -15,6 +15,13 @@ type ApiStatus = {
   isReply: boolean;
 };
 
+type CounterPresence = {
+  likes: boolean;
+  reposts: boolean;
+  quotes: boolean;
+  replies: boolean;
+};
+
 type ApiAccount = {
   id: string;
   handle: string;
@@ -144,7 +151,15 @@ function copyObject(value: unknown): JsonRecord | null {
   }
 }
 
-function statusDetails(value: JsonRecord): JsonRecord | null {
+function statusCounter(value: JsonRecord, keys: string[]): { value: number; present: boolean } {
+  const count = keys
+    .filter((key) => Object.prototype.hasOwnProperty.call(value, key))
+    .map((key) => asOptionalCount(value[key]))
+    .find((candidate): candidate is number => candidate !== null);
+  return { value: count ?? 0, present: count !== undefined };
+}
+
+function statusDetails(value: JsonRecord, counterPresence: CounterPresence): JsonRecord | null {
   const details: JsonRecord = {};
   const views = asOptionalCount(value.views);
   const bookmarks = asOptionalCount(value.bookmarks);
@@ -153,6 +168,7 @@ function statusDetails(value: JsonRecord): JsonRecord | null {
   if (bookmarks !== null) details.bookmarks = bookmarks;
   if (media && Object.keys(media).length) details.media = media;
   if (typeof value.possibly_sensitive === "boolean") details.possibly_sensitive = value.possibly_sensitive;
+  if (Object.values(counterPresence).some((present) => !present)) details._counter_presence = counterPresence;
   return Object.keys(details).length ? details : null;
 }
 
@@ -173,18 +189,23 @@ export function normalizeStatus(value: unknown): ApiStatus | null {
   const authorId = asId(authorValue?.id) ?? screenName;
   const name = asString(authorValue?.name) ?? screenName;
   const url = asString(value.url) ?? `https://x.com/${encodeURIComponent(screenName)}/status/${id}`;
+  const likes = statusCounter(value, ["likes"]);
+  const reposts = statusCounter(value, ["retweets", "reposts"]);
+  const quotes = statusCounter(value, ["quotes"]);
+  const replies = statusCounter(value, ["replies"]);
+  const counterPresence = { likes: likes.present, reposts: reposts.present, quotes: quotes.present, replies: replies.present };
   return {
     id,
     url,
     text: typeof value.text === "string" ? value.text : "",
     createdTimestamp: timestamp,
-    likes: Math.max(0, Math.floor(asNumber(value.likes))),
-    reposts: Math.max(0, Math.floor(asNumber(value.retweets ?? value.reposts))),
-    quotes: Math.max(0, Math.floor(asNumber(value.quotes))),
-    replies: Math.max(0, Math.floor(asNumber(value.replies))),
+    likes: likes.value,
+    reposts: reposts.value,
+    quotes: quotes.value,
+    replies: replies.value,
     author: { id: authorId, screenName, name },
     quote: copyObject(value.quote),
-    details: statusDetails(value),
+    details: statusDetails(value, counterPresence),
     isReply: isReply(value),
   };
 }
@@ -413,10 +434,10 @@ function postsStatements(
          author_id, author_screen_name, author_name, quote_json, details_json, source_kind, source_key, collected_at)
       VALUES ${rows}
       ON CONFLICT(id) DO UPDATE SET
-        likes = MAX(posts.likes, excluded.likes),
-        reposts = MAX(posts.reposts, excluded.reposts),
-        quotes = MAX(posts.quotes, excluded.quotes),
-        replies = MAX(posts.replies, excluded.replies),
+        likes = CASE WHEN json_extract(excluded.details_json, '$._counter_presence.likes') = 0 THEN posts.likes ELSE excluded.likes END,
+        reposts = CASE WHEN json_extract(excluded.details_json, '$._counter_presence.reposts') = 0 THEN posts.reposts ELSE excluded.reposts END,
+        quotes = CASE WHEN json_extract(excluded.details_json, '$._counter_presence.quotes') = 0 THEN posts.quotes ELSE excluded.quotes END,
+        replies = CASE WHEN json_extract(excluded.details_json, '$._counter_presence.replies') = 0 THEN posts.replies ELSE excluded.replies END,
         quote_json = COALESCE(excluded.quote_json, posts.quote_json),
         details_json = CASE
           WHEN excluded.details_json IS NULL THEN posts.details_json
@@ -1208,14 +1229,28 @@ export async function candidates(request: Request, env: RuntimeEnv): Promise<Res
   // ponytail: scan the strongest 1,000 engagement-ranked rows; move full scoring into SQL only if daily volume hides candidates.
   const scanLimit = Math.min(MAX_CANDIDATE_SCAN, Math.max(200, limit * 20));
   const rows = await env.DB.prepare(`
+    WITH eligible AS (
+      SELECT id, url, text, created_timestamp, likes, reposts, quotes, replies,
+        author_id, author_screen_name, author_name, quote_json, details_json, source_kind, source_key,
+        COALESCE(CAST(json_extract(details_json, '$.bookmarks') AS INTEGER), 0) AS bookmarks,
+        CASE
+          WHEN (? - created_timestamp * 1000) <= 0 THEN 10
+          WHEN (? - created_timestamp * 1000) >= 86400000 THEN 100
+          ELSE MAX(10, CAST(((? - created_timestamp * 1000) + 863999) / 864000 AS INTEGER))
+        END AS minimum_likes
+      FROM posts
+      WHERE created_timestamp >= ?
+    )
     SELECT id, url, text, created_timestamp, likes, reposts, quotes, replies,
       author_id, author_screen_name, author_name, quote_json, details_json, source_kind, source_key
-    FROM posts
-    WHERE created_timestamp >= ?
-    ORDER BY (likes + reposts * 2 + quotes * 3 + COALESCE(CAST(json_extract(details_json, '$.bookmarks') AS INTEGER), 0) * 3) DESC,
+    FROM eligible
+    WHERE likes >= minimum_likes
+      OR bookmarks >= MAX(5, (minimum_likes + 3) / 4)
+      OR (source_kind = 'following' AND likes >= MAX(10, (minimum_likes + 1) / 2))
+    ORDER BY (likes + reposts * 2 + quotes * 3 + bookmarks * 3) DESC,
       created_timestamp DESC, id DESC
     LIMIT ?
-  `).bind(cutoff, scanLimit).all<DbFeedRow>();
+  `).bind(generatedAtMs, generatedAtMs, generatedAtMs, cutoff, scanLimit).all<DbFeedRow>();
   const ranked = rows.results
     .map((row) => candidateFor(row, generatedAtMs))
     .filter((post) => post !== null)

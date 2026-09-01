@@ -148,20 +148,24 @@ describe("FxEmbed collector", () => {
     expect(status?.details).toBeNull();
   });
 
-  it("refreshes engagement and post details when a collected post appears again", async () => {
+  it("refreshes explicit counter changes and preserves omitted counters and details", async () => {
     await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("refresh").run();
     let run = 0;
     vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
       run += 1;
+      const counters = run === 1
+        ? { likes: 250, reposts: 30, quotes: 20, replies: 10 }
+        : run === 2
+          ? { likes: 125, reposts: 15, quotes: 8, replies: 4 }
+          : {};
       return new Response(JSON.stringify({ results: { timeline: [{
         id: "growing",
         url: "https://x.com/alice/status/growing",
         text: "伸びた投稿",
         created_timestamp: 1_700_000_000,
-        likes: run === 1 ? 1 : 250,
-        reposts: run === 1 ? 0 : 30,
+        ...counters,
         bookmarks: run === 1 ? 40 : 80,
-        views: run === 1 ? 10 : 20_000,
+        views: run === 1 ? 10 : run === 2 ? 20_000 : 30_000,
         ...(run === 1 ? {
           media: { photos: [{ type: "photo", url: "https://example.com/growing.jpg", width: 100, height: 100 }] },
           possibly_sensitive: true,
@@ -172,13 +176,16 @@ describe("FxEmbed collector", () => {
 
     await collectOnce(runtimeEnv, 1_700_000_100_000);
     await collectOnce(runtimeEnv, 1_700_000_101_000);
+    await collectOnce(runtimeEnv, 1_700_000_102_000);
 
-    const post = await db.prepare("SELECT likes, reposts, details_json FROM posts WHERE id = ?").bind("growing").first<{ likes: number; reposts: number; details_json: string }>();
-    expect(post?.likes).toBe(250);
-    expect(post?.reposts).toBe(30);
+    const post = await db.prepare("SELECT likes, reposts, quotes, replies, details_json FROM posts WHERE id = ?").bind("growing").first<{ likes: number; reposts: number; quotes: number; replies: number; details_json: string }>();
+    expect(post?.likes).toBe(125);
+    expect(post?.reposts).toBe(15);
+    expect(post?.quotes).toBe(8);
+    expect(post?.replies).toBe(4);
     expect(JSON.parse(post?.details_json ?? "null")).toMatchObject({
       bookmarks: 80,
-      views: 20_000,
+      views: 30_000,
       media: { photos: [{ type: "photo", url: "https://example.com/growing.jpg" }] },
       possibly_sensitive: true,
     });
@@ -1557,6 +1564,96 @@ describe("candidates", () => {
     const body = await response.json() as { posts: Array<{ id: string; bookmarks: number | null }> };
     expect(body.posts).toHaveLength(1);
     expect(body.posts[0]).toMatchObject({ id: "bookmark-qualified", bookmarks: 100 });
+  });
+
+  it("keeps a following-qualified post when ineligible search rows fill the scan", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const createdTimestamp = now - 23 * 3600;
+    const collectedAt = new Date(now * 1000).toISOString();
+    await db.prepare(`WITH RECURSIVE noise(n) AS (
+      SELECT 1
+      UNION ALL
+      SELECT n + 1 FROM noise WHERE n < 200
+    )
+    INSERT INTO posts
+      (id, url, text, created_timestamp, likes, reposts, quotes, replies, author_id,
+       author_screen_name, author_name, quote_json, details_json, source_kind, source_key, collected_at)
+    SELECT
+      'noise-' || n, 'https://x.com/noise/status/' || n, 'ノイズ', ?, 95, 0, 0, 0,
+      'noise', 'noise', 'Noise', NULL, NULL, 'search', 'noise query', ?
+    FROM noise`).bind(createdTimestamp, collectedAt).run();
+    await db.prepare(`INSERT INTO posts
+      (id, url, text, created_timestamp, likes, reposts, quotes, replies, author_id,
+       author_screen_name, author_name, quote_json, details_json, source_kind, source_key, collected_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      "following-qualified",
+      "https://x.com/alice/status/following-qualified",
+      "フォロー中の投稿",
+      createdTimestamp,
+      48,
+      0,
+      0,
+      0,
+      "a",
+      "alice",
+      "Alice",
+      null,
+      null,
+      "following",
+      "alice",
+      collectedAt,
+    ).run();
+
+    const response = await worker.fetch(new Request("https://localhost/candidates?hours=24&limit=1"), env);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { evaluated: number; posts: Array<{ id: string }> };
+    expect(body.evaluated).toBe(1);
+    expect(body.posts.map((post) => post.id)).toEqual(["following-qualified"]);
+  });
+
+  it("applies the ten-like minimum to recent search rows before the scan limit", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const createdTimestamp = now - 3600;
+    const collectedAt = new Date(now * 1000).toISOString();
+    await db.prepare(`WITH RECURSIVE noise(n) AS (
+      SELECT 1
+      UNION ALL
+      SELECT n + 1 FROM noise WHERE n < 200
+    )
+    INSERT INTO posts
+      (id, url, text, created_timestamp, likes, reposts, quotes, replies, author_id,
+       author_screen_name, author_name, quote_json, details_json, source_kind, source_key, collected_at)
+    SELECT
+      'noise-' || n, 'https://x.com/noise/status/' || n, 'ノイズ', ?, 9, 100, 100, 0,
+      'noise', 'noise', 'Noise', NULL, NULL, 'search', 'noise query', ?
+    FROM noise`).bind(createdTimestamp, collectedAt).run();
+    await db.prepare(`INSERT INTO posts
+      (id, url, text, created_timestamp, likes, reposts, quotes, replies, author_id,
+       author_screen_name, author_name, quote_json, details_json, source_kind, source_key, collected_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      "recent-following-qualified",
+      "https://x.com/alice/status/recent-following-qualified",
+      "フォロー中の新しい投稿",
+      createdTimestamp,
+      10,
+      0,
+      0,
+      0,
+      "a",
+      "alice",
+      "Alice",
+      null,
+      null,
+      "following",
+      "alice",
+      collectedAt,
+    ).run();
+
+    const response = await worker.fetch(new Request("https://localhost/candidates?hours=24&limit=1"), env);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { evaluated: number; posts: Array<{ id: string }> };
+    expect(body.evaluated).toBe(1);
+    expect(body.posts.map((post) => post.id)).toEqual(["recent-following-qualified"]);
   });
 });
 
