@@ -630,6 +630,26 @@ describe("FxEmbed collector", () => {
     expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("account_status:a").first<{ value: string }>())?.value ?? "null")).toMatchObject({ cursor: null, latest: 1_700_000_000, latest_ids: [] });
   });
 
+  it("does not requeue an unchanged fresh cursor while draining an account backlog", async () => {
+    const checkedAt = "2023-11-14T22:00:00.000Z";
+    await db.batch([
+      db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("a", "alice", "Alice", 1_699_999_900),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("account_status:a", JSON.stringify({ cursor: "page-2", queued_cursor: null, since: 1_699_999_900, latest: 1_700_000_000, latest_ids: ["fresh"] }), checkedAt),
+    ]);
+    await markFollowingAsCurrent();
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [{
+        id: "fresh", url: "https://x.com/alice/status/fresh", text: "fresh", created_timestamp: 1_700_000_000,
+        author: { id: "a", screen_name: "alice", name: "Alice" },
+      }] }, cursor: { bottom: "page-1" } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } })));
+
+    await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("account_status:a").first<{ value: string }>())?.value ?? "null")).toMatchObject({ cursor: null, queued_cursor: null });
+  });
+
   it("does not start account history pagination when the initial timestamp is empty", async () => {
     await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind("a", "alice", "Alice").run();
     await markFollowingAsCurrent();
@@ -939,6 +959,24 @@ describe("FxEmbed collector", () => {
     expect((await db.prepare("SELECT handle FROM accounts").all<{ handle: string }>()).results).toEqual([{ handle: "new-account" }]);
   });
 
+  it("resumes account polling after reverting a failed source change", async () => {
+    const timestamp = "2999-01-01T00:00:00.000Z";
+    await db.batch([
+      db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("old", "old-account", "Old", 1_699_999_900),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_source_handle", "old-source", timestamp),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_cursor", "", timestamp),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_marker", "", timestamp),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_sync_at", timestamp, timestamp),
+      db.prepare("INSERT INTO collector_state (key, value, updated_at) VALUES (?, ?, ?)").bind("following_pending_source_handle", "failed-source", timestamp),
+    ]);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } })),
+    );
+
+    expect((await collectOnce({ DB: db, SOURCE_HANDLE: "old-source" }, 1_700_000_100_000)).accounts).toBe(1);
+    expect(new URL(String(fetchMock.mock.calls[0][0])).pathname).toBe("/2/profile/old-account/statuses");
+  });
+
   it("treats status 204 as a successful empty check", async () => {
     await db.prepare("INSERT INTO accounts (id, handle, name, last_post_timestamp) VALUES (?, ?, ?, ?)").bind("a", "alice", "Alice", 1_699_999_900).run();
     await markFollowingAsCurrent();
@@ -983,7 +1021,7 @@ describe("FxEmbed collector", () => {
     expect(JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("account_status:a").first<{ value: string }>())?.value ?? "null")).toMatchObject({ cursor: null, latest: 1_700_000_106, latest_ids: ["fresh-5"] });
   });
 
-  it("drains same-second account statuses past an idle watermark once", async () => {
+  it("drains same-second account statuses without restarting the cursor", async () => {
     const checkedAt = "2023-11-14T22:15:00.000Z";
     const knownIds = ["known-1", "known-2", "known-3", "known-4", "known-5", "known-6"];
     const status = (id: string) => ({ id, url: `https://x.com/alice/status/${id}`, text: id, created_timestamp: 1_700_000_000, author: { id: "a", screen_name: "alice", name: "Alice" } });
@@ -999,13 +1037,12 @@ describe("FxEmbed collector", () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [status("known-6"), status("new-8")] }, cursor: { bottom: "backlog-b" } })))
       .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: freshStatuses }, cursor: { bottom: "backlog-a" } })))
       .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [status("new-9")] }, cursor: { bottom: null } })))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: freshStatuses }, cursor: { bottom: "backlog-a" } })))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } })));
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: freshStatuses }, cursor: { bottom: "backlog-a" } })));
 
     await collectOnce(accountRuntimeEnv, 1_700_000_101_000);
     await collectOnce(accountRuntimeEnv, 1_700_000_102_000);
     await collectOnce(accountRuntimeEnv, 1_700_000_103_000);
-    expect(fetchMock).toHaveBeenCalledTimes(6);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
     expect((await db.prepare("SELECT id FROM posts ORDER BY id").all<{ id: string }>()).results.map((post) => post.id)).toEqual([
       "known-1", "known-2", "known-3", "known-4", "known-5", "known-6", "new-7", "new-8", "new-9",
     ]);
@@ -1018,7 +1055,7 @@ describe("FxEmbed collector", () => {
     const postCount = (await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count;
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ results: { timeline: freshStatuses }, cursor: { bottom: "should-not-restart" } })));
     await collectOnce(accountRuntimeEnv, 1_700_000_104_000);
-    expect(fetchMock).toHaveBeenCalledTimes(7);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
     expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(postCount);
     const afterIdle = JSON.parse((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("account_status:a").first<{ value: string }>())?.value ?? "null") as { cursor: string | null; latest: number; latest_ids: string[] };
     expect(afterIdle.cursor).toBeNull();

@@ -535,9 +535,12 @@ async function saveAccountFresh(
   const stateKey = accountStatusStateKey(account.id);
   let next: AccountStatusCheckpoint;
   if (checkpoint?.cursor) {
-    const queuedCursor = page.cursor === null
-      ? checkpoint.queuedCursor
-      : page.cursor === checkpoint.cursor ? checkpoint.queuedCursor : page.cursor;
+    const watermark = checkpoint.latest ?? account.last_post_timestamp;
+    const knownIds = checkpoint.latest === watermark ? checkpoint.latestIds : [];
+    const hasNewLatest = latest !== null && (watermark === null || latest > watermark ||
+      (latest === watermark && latestIds.some((id) => !knownIds.includes(id))));
+    const shouldQueue = page.cursor && hasNewLatest && page.cursor !== checkpoint.cursor && page.cursor !== checkpoint.queuedCursor;
+    const queuedCursor = shouldQueue ? page.cursor : checkpoint.queuedCursor;
     next = { ...checkpoint, queuedCursor, latest, latestIds };
   } else if (account.last_post_timestamp === null) {
     const baseline = Math.floor(Date.parse(checkedAt) / 1000);
@@ -955,7 +958,7 @@ async function shouldSyncFollowing(db: D1Database, sourceHandle: string, nowMs: 
 
 async function canCollectAccountStatuses(db: D1Database, sourceHandle: string): Promise<boolean> {
   if (await readState(db, "following_source_handle") !== sourceHandle) return false;
-  if (await readState(db, FOLLOWING_PENDING_SOURCE_KEY)) return false;
+  if (await readState(db, FOLLOWING_PENDING_SOURCE_KEY) === sourceHandle) return false;
   return Boolean(await readState(db, "following_sync_at"));
 }
 
