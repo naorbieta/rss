@@ -72,7 +72,7 @@ beforeAll(async () => {
       id TEXT PRIMARY KEY, url TEXT NOT NULL, text TEXT NOT NULL, created_timestamp INTEGER NOT NULL,
       likes INTEGER NOT NULL DEFAULT 0, reposts INTEGER NOT NULL DEFAULT 0, quotes INTEGER NOT NULL DEFAULT 0,
       replies INTEGER NOT NULL DEFAULT 0, author_id TEXT NOT NULL, author_screen_name TEXT NOT NULL,
-      author_name TEXT NOT NULL, quote_json TEXT, source_kind TEXT NOT NULL, source_key TEXT NOT NULL,
+      author_name TEXT NOT NULL, quote_json TEXT, details_json TEXT, source_kind TEXT NOT NULL, source_key TEXT NOT NULL,
       collected_at TEXT NOT NULL
     )`),
     db.prepare(`CREATE TABLE IF NOT EXISTS accounts (
@@ -112,10 +112,20 @@ describe("FxEmbed collector", () => {
       reposts: 3,
       quotes: 4,
       replies: 5,
+      views: 600,
+      bookmarks: 7,
       author: { id: "a", screen_name: "alice", name: "Alice" },
       quote: { id: "99", text: "引用本文" },
+      media: { photos: [{ type: "photo", url: "https://example.com/photo.jpg", width: 100, height: 100 }] },
+      possibly_sensitive: false,
     });
     expect(status?.quote).toEqual({ id: "99", text: "引用本文" });
+    expect(status?.details).toEqual({
+      views: 600,
+      bookmarks: 7,
+      media: { photos: [{ type: "photo", url: "https://example.com/photo.jpg", width: 100, height: 100 }] },
+      possibly_sensitive: false,
+    });
     expect(status?.isReply).toBe(false);
     expect(normalizeStatus({ ...status, created_timestamp: 1e100 })).toBeNull();
   });
@@ -132,8 +142,38 @@ describe("FxEmbed collector", () => {
       replies: 0,
       author: { id: "a", screen_name: "alice", name: "Alice" },
       quote: null,
+      media: {},
     });
     expect(status?.reposts).toBe(7);
+    expect(status?.details).toBeNull();
+  });
+
+  it("refreshes engagement and post details when a collected post appears again", async () => {
+    await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("refresh").run();
+    let run = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      run += 1;
+      return new Response(JSON.stringify({ results: { timeline: [{
+        id: "growing",
+        url: "https://x.com/alice/status/growing",
+        text: "伸びた投稿",
+        created_timestamp: 1_700_000_000,
+        likes: run === 1 ? 1 : 250,
+        reposts: run === 1 ? 0 : 30,
+        bookmarks: run === 1 ? 0 : 80,
+        views: run === 1 ? 10 : 20_000,
+        media: { photos: [{ type: "photo", url: "https://example.com/growing.jpg", width: 100, height: 100 }] },
+        author: { id: "a", screen_name: "alice", name: "Alice" },
+      }] }, cursor: { bottom: null } }));
+    });
+
+    await collectOnce(runtimeEnv, 1_700_000_100_000);
+    await collectOnce(runtimeEnv, 1_700_000_101_000);
+
+    const post = await db.prepare("SELECT likes, reposts, details_json FROM posts WHERE id = ?").bind("growing").first<{ likes: number; reposts: number; details_json: string }>();
+    expect(post?.likes).toBe(250);
+    expect(post?.reposts).toBe(30);
+    expect(JSON.parse(post?.details_json ?? "null")).toMatchObject({ bookmarks: 80, views: 20_000 });
   });
 
   it("excludes account replies but keeps search replies and checkpoints each source", async () => {
@@ -147,7 +187,7 @@ describe("FxEmbed collector", () => {
       const parsed = new URL(url);
       if (parsed.pathname === "/2/profile/alice/statuses") {
         expect(parsed.searchParams.get("since")).toBe("1699999900");
-        expect(parsed.searchParams.get("count")).toBe("6");
+        expect(parsed.searchParams.get("count")).toBe("25");
         expect(parsed.searchParams.get("with_replies")).toBeNull();
         return new Response(JSON.stringify({ code: 200, results: { timeline: [
           { id: "1", url: "https://x.com/alice/status/1", text: "投稿", created_timestamp: 1_700_000_000, author: { id: "a", screen_name: "alice", name: "Alice" } },
@@ -156,7 +196,7 @@ describe("FxEmbed collector", () => {
       }
       if (parsed.pathname === "/2/search") {
         expect(parsed.searchParams.get("feed")).toBe("latest");
-        expect(parsed.searchParams.get("count")).toBe("6");
+        expect(parsed.searchParams.get("count")).toBe("25");
         return new Response(JSON.stringify({ code: 200, results: { timeline: [
           { id: "1", url: "https://x.com/alice/status/1", text: "重複検索結果", created_timestamp: 1_700_000_000, author: { id: "a", screen_name: "alice", name: "Alice" } },
           { id: "3", url: "https://x.com/bob/status/3", text: "検索結果", created_timestamp: 1_700_000_002, author: { id: "b", screen_name: "bob", name: "Bob" }, quote: { id: "2", text: "引用" } },
@@ -181,29 +221,29 @@ describe("FxEmbed collector", () => {
     expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE query = ?").bind("cloudflare").first<{ last_checked_at: string }>())?.last_checked_at).toBe("2023-11-14T22:15:00.000Z");
   });
 
-  it("uses bounded multi-row statements for 20 following accounts and 6 posts", async () => {
+  it("chunks 50 following accounts and 20 posts into bounded statements", async () => {
     const start = 1_700_000_100_000;
     const counter = countD1Queries(db);
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const parsed = new URL(String(input));
       if (parsed.pathname === "/2/profile/source/following") {
-        expect(parsed.searchParams.get("count")).toBe("20");
-        return new Response(JSON.stringify({ results: { users: Array.from({ length: 20 }, (_, index) => ({
+        expect(parsed.searchParams.get("count")).toBe("50");
+        return new Response(JSON.stringify({ results: { users: Array.from({ length: 50 }, (_, index) => ({
           id: `following-${index}`, screen_name: `following-${index}`, name: `Following ${index}`,
         })) }, cursor: { bottom: null } }));
       }
       if (parsed.pathname === "/2/profile/alice/statuses") {
-        expect(parsed.searchParams.get("count")).toBe("6");
-        return new Response(JSON.stringify({ results: { timeline: statusFixture("account", 6) }, cursor: { bottom: null } }));
+        expect(parsed.searchParams.get("count")).toBe("25");
+        return new Response(JSON.stringify({ results: { timeline: statusFixture("account", 20) }, cursor: { bottom: null } }));
       }
       throw new Error(`unexpected fetch: ${parsed.pathname}`);
     });
 
     await syncFollowingPage(counter.db, "source", start);
-    expect((await db.prepare("SELECT COUNT(*) AS count FROM accounts").first<{ count: number }>())?.count).toBe(20);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM accounts").first<{ count: number }>())?.count).toBe(50);
     const accountStatements = counter.queries.filter((sql) => sql.includes("INSERT INTO accounts"));
-    expect(accountStatements).toHaveLength(1);
-    expect((accountStatements[0].match(/\?/g) ?? []).length).toBe(100);
+    expect(accountStatements).toHaveLength(3);
+    expect(accountStatements.map((sql) => (sql.match(/\?/g) ?? []).length)).toEqual([100, 100, 50]);
 
     await db.batch([
       db.prepare("DELETE FROM accounts"),
@@ -215,14 +255,14 @@ describe("FxEmbed collector", () => {
     counter.queries.length = 0;
 
     await collectOnce({ DB: counter.db, SOURCE_HANDLE: "source" }, start);
-    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(6);
-    const postStatements = counter.queries.filter((sql) => sql.includes("INSERT OR IGNORE INTO posts"));
-    expect(postStatements).toHaveLength(1);
-    expect((postStatements[0].match(/\?/g) ?? []).length).toBe(90);
+    expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(20);
+    const postStatements = counter.queries.filter((sql) => sql.includes("INSERT INTO posts"));
+    expect(postStatements).toHaveLength(4);
+    expect(postStatements.map((sql) => (sql.match(/\?/g) ?? []).length)).toEqual([96, 96, 96, 32]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("does not advance following state when the upstream exceeds count=20", async () => {
+  it("does not advance following state when the upstream exceeds count=50", async () => {
     const previous = "2023-11-14T22:00:00.000Z";
     await db.batch([
       db.prepare("INSERT INTO accounts (id, handle, name, sync_marker) VALUES (?, ?, ?, ?)").bind("old", "old", "Old", "old-marker"),
@@ -234,9 +274,9 @@ describe("FxEmbed collector", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const parsed = new URL(String(input));
       expect(parsed.pathname).toBe("/2/profile/source/following");
-      expect(parsed.searchParams.get("count")).toBe("20");
+      expect(parsed.searchParams.get("count")).toBe("50");
       expect(parsed.searchParams.get("cursor")).toBe("old-cursor");
-      return new Response(JSON.stringify({ results: { users: Array.from({ length: 21 }, (_, index) => ({
+      return new Response(JSON.stringify({ results: { users: Array.from({ length: 51 }, (_, index) => ({
         id: `too-many-${index}`, screen_name: `too-many-${index}`, name: `Too Many ${index}`,
       })) }, cursor: { bottom: null } }));
     });
@@ -249,14 +289,14 @@ describe("FxEmbed collector", () => {
     expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_pending_source_handle").first<{ value: string }>())?.value).toBe("source");
   });
 
-  it("does not advance account state when statuses exceed count=6", async () => {
+  it("does not advance account state when statuses exceed count=25", async () => {
     await db.prepare("INSERT INTO accounts (id, handle, name) VALUES (?, ?, ?)").bind("a", "alice", "Alice").run();
     await markFollowingAsCurrent();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const parsed = new URL(String(input));
       expect(parsed.pathname).toBe("/2/profile/alice/statuses");
-      expect(parsed.searchParams.get("count")).toBe("6");
-      return new Response(JSON.stringify({ results: { timeline: statusFixture("too-many-statuses", 7) }, cursor: { bottom: "unexpected" } }));
+      expect(parsed.searchParams.get("count")).toBe("25");
+      return new Response(JSON.stringify({ results: { timeline: statusFixture("too-many-statuses", 26) }, cursor: { bottom: "unexpected" } }));
     });
 
     expect((await collectOnce(accountRuntimeEnv, 1_700_000_100_000)).accounts).toBe(1);
@@ -266,13 +306,13 @@ describe("FxEmbed collector", () => {
     expect((await db.prepare("SELECT COUNT(*) AS count FROM collector_state WHERE key = ?").bind("account_status:a").first<{ count: number }>())?.count).toBe(0);
   });
 
-  it("does not advance search state when results exceed count=6", async () => {
+  it("does not advance search state when results exceed count=25", async () => {
     await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind("too-many-results").run();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const parsed = new URL(String(input));
       expect(parsed.pathname).toBe("/2/search");
-      expect(parsed.searchParams.get("count")).toBe("6");
-      return new Response(JSON.stringify({ results: { timeline: statusFixture("too-many-results", 7) }, cursor: { bottom: "unexpected" } }));
+      expect(parsed.searchParams.get("count")).toBe("25");
+      return new Response(JSON.stringify({ results: { timeline: statusFixture("too-many-results", 26) }, cursor: { bottom: "unexpected" } }));
     });
 
     expect((await collectOnce(runtimeEnv, 1_700_000_100_000)).queries).toBe(1);
@@ -342,25 +382,24 @@ describe("FxEmbed collector", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const parsed = new URL(String(input));
       if (parsed.pathname.endsWith("/statuses")) {
-        expect(parsed.searchParams.get("count")).toBe("6");
-        return new Response(JSON.stringify({ results: { timeline: statusFixture(parsed.pathname.split("/").at(-2) ?? "account", 6) }, cursor: { bottom: parsed.searchParams.has("cursor") ? null : "account-backlog" } }));
+        expect(parsed.searchParams.get("count")).toBe("25");
+        return new Response(JSON.stringify({ results: { timeline: statusFixture(parsed.pathname.split("/").at(-2) ?? "account", 20) }, cursor: { bottom: parsed.searchParams.has("cursor") ? null : "account-backlog" } }));
       }
       if (parsed.pathname === "/2/search") {
-        expect(parsed.searchParams.get("count")).toBe("6");
+        expect(parsed.searchParams.get("count")).toBe("25");
         const isBacklog = parsed.searchParams.has("cursor");
-        return new Response(JSON.stringify({ results: { timeline: statusFixture(parsed.searchParams.get("q") ?? "query", 6) }, cursor: { bottom: isBacklog ? null : "fresh-cursor" } }));
+        return new Response(JSON.stringify({ results: { timeline: statusFixture(parsed.searchParams.get("q") ?? "query", 20) }, cursor: { bottom: isBacklog ? null : "fresh-cursor" } }));
       }
       throw new Error(`unexpected fetch: ${parsed.pathname}`);
     });
 
     const result = await collectOnce({ DB: counter.db, SOURCE_HANDLE: "source" }, 1_700_000_100_000);
-    expect(result).toEqual({ following: false, accounts: 2, queries: 3 });
-    expect(counter.queries.length).toBe(49);
+    expect(result).toEqual({ following: false, accounts: 1, queries: 1 });
     expect(counter.queries.length).toBeLessThanOrEqual(50);
-    expect(fetchMock).toHaveBeenCalledTimes(10);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
-  it("keeps a following final page and three searches within 50 D1 queries", async () => {
+  it("keeps a following final page and one search within 50 D1 queries", async () => {
     const start = 1_700_000_100_000;
     const previousSync = new Date(start - 25 * 60 * 60 * 1000).toISOString();
     await db.batch([
@@ -383,29 +422,24 @@ describe("FxEmbed collector", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const parsed = new URL(String(input));
       if (parsed.pathname === "/2/profile/source/following") {
-        expect(parsed.searchParams.get("count")).toBe("20");
+        expect(parsed.searchParams.get("count")).toBe("50");
         return new Response(JSON.stringify({ results: { users: Array.from({ length: 20 }, (_, index) => ({
           id: `following-${index}`, screen_name: `following-${index}`, name: `Following ${index}`,
         })) }, cursor: { bottom: null } }));
       }
       if (parsed.pathname === "/2/search") {
-        expect(parsed.searchParams.get("count")).toBe("6");
+        expect(parsed.searchParams.get("count")).toBe("25");
         const isBacklog = parsed.searchParams.has("cursor");
-        return new Response(JSON.stringify({ results: { timeline: statusFixture(parsed.searchParams.get("q") ?? "query", 6) }, cursor: { bottom: isBacklog ? null : "fresh-cursor" } }));
+        return new Response(JSON.stringify({ results: { timeline: statusFixture(parsed.searchParams.get("q") ?? "query", 20) }, cursor: { bottom: isBacklog ? null : "fresh-cursor" } }));
       }
       throw new Error(`unexpected fetch: ${parsed.pathname}`);
     });
 
     const result = await collectOnce({ DB: counter.db, SOURCE_HANDLE: "source" }, start);
-    expect(result).toEqual({ following: true, accounts: 0, queries: 3 });
-    expect(counter.queries.length).toBe(42);
+    expect(result).toEqual({ following: true, accounts: 0, queries: 1 });
     expect(counter.queries.length).toBeLessThanOrEqual(50);
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
       "/2/profile/source/following",
-      "/2/search",
-      "/2/search",
-      "/2/search",
-      "/2/search",
       "/2/search",
       "/2/search",
     ]);
@@ -417,7 +451,7 @@ describe("FxEmbed collector", () => {
     fetchMock.mockImplementationOnce(async (input) => {
       const parsed = new URL(String(input));
       expect(parsed.pathname).toBe("/2/profile/source/following");
-      expect(parsed.searchParams.get("count")).toBe("20");
+      expect(parsed.searchParams.get("count")).toBe("50");
       expect(parsed.searchParams.get("cursor")).toBeNull();
       return new Response(JSON.stringify({ results: { users: [{ id: "a", screen_name: "alice", name: "Alice" }] }, cursor: { bottom: "next" } }));
     });
@@ -429,7 +463,7 @@ describe("FxEmbed collector", () => {
       const parsed = new URL(String(input));
       expect(parsed.pathname).toBe("/2/profile/source/following");
       expect(parsed.searchParams.get("cursor")).toBe("next");
-      return new Response(JSON.stringify({ results: { users: [{ id: "b", screen_name: "bob", name: "Bob", protected: true }] }, cursor: { bottom: null } }));
+      return new Response(JSON.stringify({ results: { users: [{ id: "b", screen_name: "bob", name: "Bob", protected: true }] }, cursor: { bottom: "0|end" } }));
     });
     await syncFollowingPage(db, "source", 1_700_000_101_000);
     expect((await db.prepare("SELECT handle FROM accounts ORDER BY handle").all<{ handle: string }>()).results.map((row) => row.handle)).toEqual(["alice", "bob"]);
@@ -646,11 +680,10 @@ describe("FxEmbed collector", () => {
 
     expect((await collectOnce(accountRuntimeEnv, start)).following).toBe(true);
     expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_scan_position").first<{ value: string }>())?.value).toBe("3");
-    expect((await collectOnce(accountRuntimeEnv, start + 15 * 60 * 1000)).accounts).toBe(2);
+    expect((await collectOnce(accountRuntimeEnv, start + 15 * 60 * 1000)).accounts).toBe(1);
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
       "/2/profile/source/following",
       "/2/profile/h03/statuses",
-      "/2/profile/h04/statuses",
     ]);
   });
 
@@ -938,15 +971,16 @@ describe("FxEmbed collector", () => {
     });
 
     await collectOnce(accountRuntimeEnv, 1_700_000_100_000);
-    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_scan_position").first<{ value: string }>())?.value).toBe("2");
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_scan_position").first<{ value: string }>())?.value).toBe("1");
     fetchMock.mockClear();
     await collectOnce(accountRuntimeEnv, 1_700_000_101_000);
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
-      "/2/profile/h02/statuses",
-      "/2/profile/h03/statuses",
+      "/2/profile/h01/statuses",
     ]);
     fetchMock.mockClear();
     await collectOnce(accountRuntimeEnv, 1_700_000_102_000);
+    await collectOnce(accountRuntimeEnv, 1_700_000_103_000);
+    await collectOnce(accountRuntimeEnv, 1_700_000_104_000);
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toContain("/2/profile/h00/statuses");
   });
 
@@ -1004,7 +1038,7 @@ describe("FxEmbed collector", () => {
     expect((await db.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count).toBe(18);
   });
 
-  it("rotates search attempts after three persistent failures", async () => {
+  it("rotates search attempts after persistent failures", async () => {
     for (let index = 1; index <= 6; index += 1) {
       await db.prepare("INSERT INTO search_queries (query) VALUES (?)").bind(`q${index}`).run();
     }
@@ -1014,15 +1048,17 @@ describe("FxEmbed collector", () => {
       return new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } }));
     });
 
-    await collectOnce(runtimeEnv, 1_700_000_100_000);
-    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).searchParams.get("q"))).toEqual(["q1", "q2", "q3"]);
-    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("search_scan_position").first<{ value: string }>())?.value).toBe("3");
+    for (let index = 0; index < 5; index += 1) {
+      await collectOnce(runtimeEnv, 1_700_000_100_000 + index);
+    }
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).searchParams.get("q"))).toEqual(["q1", "q2", "q3", "q4", "q5"]);
+    expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("search_scan_position").first<{ value: string }>())?.value).toBe("5");
 
     fetchMock.mockClear();
     fetchMock.mockImplementation(async () => new Response(JSON.stringify({ results: { timeline: [] }, cursor: { bottom: null } })));
-    await collectOnce(runtimeEnv, 1_700_000_101_000);
-    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).searchParams.get("q"))).toEqual(["q4", "q5", "q6"]);
-    expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE query = ?").bind("q6").first<{ last_checked_at: string }>())?.last_checked_at).toBe("2023-11-14T22:15:01.000Z");
+    await collectOnce(runtimeEnv, 1_700_000_105_000);
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).searchParams.get("q"))).toEqual(["q6"]);
+    expect((await db.prepare("SELECT last_checked_at FROM search_queries WHERE query = ?").bind("q6").first<{ last_checked_at: string }>())?.last_checked_at).toBe("2023-11-14T22:15:05.000Z");
   });
 
   it("fetches fresh latest before backlog and stops at its watermark", async () => {
@@ -1350,13 +1386,13 @@ describe("feed", () => {
     const now = Math.floor(Date.now() / 1000);
     const collectedAt = new Date(now * 1000).toISOString();
     await db.batch([
-      ["z", now, null],
-      ["2", now - 10, null],
-      ["1", now - 10, { id: "q", text: "引用" }],
-      ["old", now - 7200, null],
-    ].map(([id, timestamp, quote]) => db.prepare(`INSERT INTO posts
-      (id, url, text, created_timestamp, author_id, author_screen_name, author_name, quote_json, source_kind, source_key, collected_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      ["z", now, null, { views: 1_000, bookmarks: 20, media: { photos: [{ type: "photo", url: "https://example.com/z.jpg", width: 100, height: 100 }] } }],
+      ["2", now - 10, null, null],
+      ["1", now - 10, { id: "q", text: "引用" }, null],
+      ["old", now - 7200, null, null],
+    ].map(([id, timestamp, quote, details]) => db.prepare(`INSERT INTO posts
+      (id, url, text, created_timestamp, author_id, author_screen_name, author_name, quote_json, details_json, source_kind, source_key, collected_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
       id,
       `https://x.com/a/status/${id}`,
       "本文",
@@ -1365,6 +1401,7 @@ describe("feed", () => {
       "alice",
       "Alice",
       quote ? JSON.stringify(quote) : null,
+      details ? JSON.stringify(details) : null,
       "search",
       "cloudflare",
       collectedAt,
@@ -1372,7 +1409,7 @@ describe("feed", () => {
 
     const first = await worker.fetch(new Request("https://localhost/feed?page=1&limit=2&hours=1"), env);
     expect(first.status).toBe(200);
-    const body = await first.json() as { generated_at: string; page: number; limit: number; hours: number; posts: Array<{ id: string; created_at: string; quote: unknown }>; items?: unknown };
+    const body = await first.json() as { generated_at: string; page: number; limit: number; hours: number; posts: Array<{ id: string; created_at: string; quote: unknown; views: number | null; bookmarks: number | null; media: unknown }>; items?: unknown };
     expect(body.generated_at).toMatch(/Z$/);
     expect(body.page).toBe(1);
     expect(body.limit).toBe(2);
@@ -1380,6 +1417,8 @@ describe("feed", () => {
     expect(body.items).toBeUndefined();
     expect(body.posts.map((post) => post.id)).toEqual(["z", "2"]);
     expect(body.posts[0].created_at).toBe(new Date(now * 1000).toISOString());
+    expect(body.posts[0]).toMatchObject({ views: 1_000, bookmarks: 20 });
+    expect(body.posts[0].media).toEqual({ photos: [{ type: "photo", url: "https://example.com/z.jpg", width: 100, height: 100 }] });
 
     const second = await worker.fetch(new Request("https://localhost/feed?page=2&limit=2&hours=1"), env);
     const secondBody = await second.json() as { posts: Array<{ id: string; created_at: string; quote: unknown }> };
@@ -1390,6 +1429,80 @@ describe("feed", () => {
 
   it("rejects invalid pagination", async () => {
     const response = await worker.fetch(new Request("https://localhost/feed?page=0&limit=101"), env);
+    expect(response.status).toBe(400);
+  });
+});
+
+describe("candidates", () => {
+  it("removes near-zero search results and ranks bookmark-like posts with media details", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const collectedAt = new Date(now * 1000).toISOString();
+    const insert = (post: {
+      id: string;
+      ageHours: number;
+      likes: number;
+      reposts?: number;
+      quotes?: number;
+      quote?: Record<string, unknown> | null;
+      details?: Record<string, unknown> | null;
+      sourceKind?: "search" | "following";
+      author?: string;
+      sourceKey?: string;
+    }) => db.prepare(`INSERT INTO posts
+      (id, url, text, created_timestamp, likes, reposts, quotes, author_id, author_screen_name,
+       author_name, quote_json, details_json, source_kind, source_key, collected_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      post.id,
+      `https://x.com/alice/status/${post.id}`,
+      post.id === "useful" ? "現場で得た具体的な知見".repeat(8) : post.id,
+      now - post.ageHours * 3600,
+      post.likes,
+      post.reposts ?? 0,
+      post.quotes ?? 0,
+      post.author ?? "a",
+      post.author ?? "alice",
+      post.author ?? "Alice",
+      post.quote ? JSON.stringify(post.quote) : null,
+      post.details ? JSON.stringify(post.details) : null,
+      post.sourceKind ?? "search",
+      post.sourceKey ?? (post.sourceKind === "following" ? "alice" : "test query"),
+      collectedAt,
+    );
+
+    await db.batch([
+      insert({ id: "popular-image", ageHours: 12, likes: 300, reposts: 50, quotes: 10, quote: { id: "quoted" }, details: {
+        bookmarks: 500,
+        views: 50_000,
+        media: { photos: [{ type: "photo", url: "https://example.com/popular.jpg", width: 100, height: 100 }] },
+      } }),
+      insert({ id: "useful", ageHours: 12, likes: 60, details: { bookmarks: 30, views: 5_000 } }),
+      insert({ id: "followed", ageHours: 20, likes: 50, sourceKind: "following" }),
+      insert({ id: "different", ageHours: 12, likes: 55, details: { bookmarks: 20 }, author: "bob", sourceKey: "other query" }),
+      insert({ id: "one-like-image", ageHours: 1, likes: 1, details: {
+        bookmarks: 0,
+        views: 20,
+        media: { photos: [{ type: "photo", url: "https://example.com/weak.jpg", width: 100, height: 100 }] },
+      } }),
+    ]);
+
+    const response = await worker.fetch(new Request("https://localhost/candidates?hours=24&limit=10"), env);
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      criteria: { search_minimum_likes_at_24h: number };
+      posts: Array<{ id: string; bookmarks: number | null; views: number | null; media: unknown; selection: { signals: string[] } }>;
+    };
+    expect(body.criteria.search_minimum_likes_at_24h).toBe(100);
+    expect(body.posts.map((post) => post.id)).toEqual(["popular-image", "different", "useful", "followed"]);
+    expect(body.posts[0]).toMatchObject({ bookmarks: 500, views: 50_000 });
+    expect(body.posts[0].media).toEqual({ photos: [{ type: "photo", url: "https://example.com/popular.jpg", width: 100, height: 100 }] });
+    expect(body.posts[0].selection.signals).toEqual(expect.arrayContaining(["popular", "bookmarked_by_many", "media", "quote"]));
+
+    const diverse = await worker.fetch(new Request("https://localhost/candidates?hours=24&limit=2"), env);
+    expect((await diverse.json() as { posts: Array<{ id: string }> }).posts.map((post) => post.id)).toEqual(["popular-image", "different"]);
+  });
+
+  it("rejects invalid candidate limits", async () => {
+    const response = await worker.fetch(new Request("https://localhost/candidates?limit=51"), env);
     expect(response.status).toBe(400);
   });
 });

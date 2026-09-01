@@ -11,6 +11,7 @@ type ApiStatus = {
   replies: number;
   author: { id: string; screenName: string; name: string };
   quote: JsonRecord | null;
+  details: JsonRecord | null;
   isReply: boolean;
 };
 
@@ -72,6 +73,7 @@ type DbFeedRow = {
   author_screen_name: string;
   author_name: string;
   quote_json: string | null;
+  details_json: string | null;
   source_kind: string;
   source_key: string;
 };
@@ -81,16 +83,20 @@ type RuntimeEnv = Pick<WorkerEnv, "DB"> & { SOURCE_HANDLE: string };
 
 const API_BASE = "https://api.fxtwitter.com";
 const FETCH_TIMEOUT_MS = 10_000;
-const FOLLOWING_API_COUNT = 20;
-const STATUS_API_COUNT = 6;
-const SEARCH_API_COUNT = 6;
-const MAX_ACCOUNTS_PER_RUN = 2;
-const MAX_QUERIES_PER_RUN = 3;
+const FOLLOWING_API_COUNT = 50;
+const FOLLOWING_DB_CHUNK = 20;
+const STATUS_API_COUNT = 25;
+const SEARCH_API_COUNT = 25;
+const POST_DB_CHUNK = 6;
+const MAX_ACCOUNTS_PER_RUN = 1;
+const MAX_QUERIES_PER_RUN = 1;
 const MAX_MANAGED_QUERIES = 20;
 const MAX_QUERY_LENGTH = 200;
 const MAX_QUERY_BODY_BYTES = 32 * 1024;
+const MAX_CANDIDATE_LIMIT = 50;
+const MAX_CANDIDATE_SCAN = 1_000;
 const FOLLOWING_RESYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
-// No-following runs make at most 10 upstream requests (2 accounts + 3 queries, each fresh/backlog), so 100 seconds at timeout; the 10-minute lease is ample and below the 15-minute Cron interval.
+// No-following runs make at most 4 upstream requests (1 account + 1 query, each fresh/backlog), so 40 seconds at timeout; the 10-minute lease is ample and below the 15-minute Cron interval.
 const COLLECTION_LEASE_MS = 10 * 60 * 1000;
 const ACCOUNT_STATUS_STATE_PREFIX = "account_status:";
 const SEARCH_QUERY_STATE_PREFIX = "search_query:";
@@ -116,6 +122,11 @@ function asNumber(value: unknown, fallback = 0): number {
   return Number.isFinite(number) ? number : fallback;
 }
 
+function asOptionalCount(value: unknown): number | null {
+  const number = asNumber(value, NaN);
+  return Number.isFinite(number) && number >= 0 ? Math.floor(number) : null;
+}
+
 function asTimestamp(value: unknown): number | null {
   const number = asNumber(value, NaN);
   if (!Number.isFinite(number) || number <= 0) return null;
@@ -131,6 +142,18 @@ function copyObject(value: unknown): JsonRecord | null {
   } catch {
     return null;
   }
+}
+
+function statusDetails(value: JsonRecord): JsonRecord | null {
+  const details: JsonRecord = {};
+  const views = asOptionalCount(value.views);
+  const bookmarks = asOptionalCount(value.bookmarks);
+  const media = copyObject(value.media);
+  if (views !== null) details.views = views;
+  if (bookmarks !== null) details.bookmarks = bookmarks;
+  if (media && Object.keys(media).length) details.media = media;
+  if (typeof value.possibly_sensitive === "boolean") details.possibly_sensitive = value.possibly_sensitive;
+  return Object.keys(details).length ? details : null;
 }
 
 function isReply(value: JsonRecord): boolean {
@@ -161,6 +184,7 @@ export function normalizeStatus(value: unknown): ApiStatus | null {
     replies: Math.max(0, Math.floor(asNumber(value.replies))),
     author: { id: authorId, screenName, name },
     quote: copyObject(value.quote),
+    details: statusDetails(value),
     isReply: isReply(value),
   };
 }
@@ -202,7 +226,8 @@ function responseCursor(value: unknown): string | null {
   const next = cursor[key];
   if (next === null) return null;
   if (typeof next !== "string" || !next.trim()) throw new Error("upstream payload has an invalid cursor");
-  return next.trim();
+  const normalized = next.trim();
+  return normalized.startsWith("0|") ? null : normalized;
 }
 
 type FetchOptions = { allowNoContent?: boolean; allowNotFoundEmpty?: boolean };
@@ -350,41 +375,56 @@ async function readSearchQueryCheckpoint(db: D1Database, query: DbQuery): Promis
   }
 }
 
-function postsStatement(
+function postsStatements(
   db: D1Database,
   posts: ApiStatus[],
   sourceKind: "following" | "search",
   sourceKey: string,
   collectedAt: string,
-): D1PreparedStatement | null {
-  if (!posts.length) return null;
-  const values: Array<string | number | null> = [];
-  const rows = posts.map((post) => {
-    values.push(
-      post.id,
-      post.url,
-      post.text,
-      post.createdTimestamp,
-      post.likes,
-      post.reposts,
-      post.quotes,
-      post.replies,
-      post.author.id,
-      post.author.screenName,
-      post.author.name,
-      post.quote ? JSON.stringify(post.quote) : null,
-      sourceKind,
-      sourceKey,
-      collectedAt,
-    );
-    return "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-  }).join(", ");
-  return db.prepare(`
-    INSERT OR IGNORE INTO posts
-      (id, url, text, created_timestamp, likes, reposts, quotes, replies,
-       author_id, author_screen_name, author_name, quote_json, source_kind, source_key, collected_at)
-    VALUES ${rows}
-  `).bind(...values);
+): D1PreparedStatement[] {
+  const statements: D1PreparedStatement[] = [];
+  for (let offset = 0; offset < posts.length; offset += POST_DB_CHUNK) {
+    const chunk = posts.slice(offset, offset + POST_DB_CHUNK);
+    const values: Array<string | number | null> = [];
+    const rows = chunk.map((post) => {
+      values.push(
+        post.id,
+        post.url,
+        post.text,
+        post.createdTimestamp,
+        post.likes,
+        post.reposts,
+        post.quotes,
+        post.replies,
+        post.author.id,
+        post.author.screenName,
+        post.author.name,
+        post.quote ? JSON.stringify(post.quote) : null,
+        post.details ? JSON.stringify(post.details) : null,
+        sourceKind,
+        sourceKey,
+        collectedAt,
+      );
+      return "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    }).join(", ");
+    statements.push(db.prepare(`
+      INSERT INTO posts
+        (id, url, text, created_timestamp, likes, reposts, quotes, replies,
+         author_id, author_screen_name, author_name, quote_json, details_json, source_kind, source_key, collected_at)
+      VALUES ${rows}
+      ON CONFLICT(id) DO UPDATE SET
+        likes = MAX(posts.likes, excluded.likes),
+        reposts = MAX(posts.reposts, excluded.reposts),
+        quotes = MAX(posts.quotes, excluded.quotes),
+        replies = MAX(posts.replies, excluded.replies),
+        quote_json = COALESCE(excluded.quote_json, posts.quote_json),
+        details_json = COALESCE(excluded.details_json, posts.details_json),
+        source_kind = CASE WHEN excluded.source_kind = 'following' THEN excluded.source_kind ELSE posts.source_kind END,
+        source_key = CASE WHEN excluded.source_kind = 'following' THEN excluded.source_key ELSE posts.source_key END,
+        collected_at = excluded.collected_at
+    `).bind(...values));
+  }
+  return statements;
 }
 
 function accountCheckpointValue(checkpoint: AccountStatusCheckpoint): string {
@@ -423,8 +463,7 @@ async function saveAccountFresh(
   const latest = latestTimestamp(account, checkpoint, page.statuses);
   const latestIds = latestAccountIds(account, checkpoint, page.statuses, latest);
   const statements: D1PreparedStatement[] = [];
-  const posts = postsStatement(db, page.statuses.filter((post) => !post.isReply), "following", account.handle, checkedAt);
-  if (posts) statements.push(posts);
+  statements.push(...postsStatements(db, page.statuses.filter((post) => !post.isReply), "following", account.handle, checkedAt));
   const stateKey = accountStatusStateKey(account.id);
   let next: AccountStatusCheckpoint;
   if (checkpoint?.cursor) {
@@ -480,8 +519,7 @@ async function saveAccountBacklog(
   const latest = latestTimestamp(account, checkpoint, page.statuses);
   const latestIds = latestAccountIds(account, checkpoint, page.statuses, latest);
   const statements: D1PreparedStatement[] = [];
-  const posts = postsStatement(db, page.statuses.filter((post) => !post.isReply), "following", account.handle, checkedAt);
-  if (posts) statements.push(posts);
+  statements.push(...postsStatements(db, page.statuses.filter((post) => !post.isReply), "following", account.handle, checkedAt));
   const stateKey = accountStatusStateKey(account.id);
   let next: AccountStatusCheckpoint;
   if (page.cursor) {
@@ -604,8 +642,7 @@ async function saveSearchLatest(
     }
   }
   const statements: D1PreparedStatement[] = [];
-  const posts = postsStatement(db, page.statuses, "search", query.query, checkedAt);
-  if (posts) statements.push(posts);
+  statements.push(...postsStatements(db, page.statuses, "search", query.query, checkedAt));
   statements.push(db.prepare("UPDATE search_queries SET last_checked_at = ? WHERE id = ?").bind(checkedAt, query.id));
   statements.push(stateStatement(db, searchQueryStateKey(query.id), searchCheckpointValue(query, next), checkedAt));
   await db.batch(statements);
@@ -648,8 +685,7 @@ async function saveSearchBacklog(
         }
       : { ...checkpoint, backlogCursor: page.cursor, queuedCursor: reachedQueuedCursor ? null : checkpoint.queuedCursor, pendingLatest, pendingLatestIds };
   const statements: D1PreparedStatement[] = [];
-  const posts = postsStatement(db, page.statuses, "search", query.query, checkedAt);
-  if (posts) statements.push(posts);
+  statements.push(...postsStatements(db, page.statuses, "search", query.query, checkedAt));
   statements.push(stateStatement(db, searchQueryStateKey(query.id), searchCheckpointValue(query, next), checkedAt));
   await db.batch(statements);
 }
@@ -666,15 +702,12 @@ export async function syncFollowingPage(db: D1Database, sourceHandle: string, no
   const body = await fetchApi(`${API_BASE}/2/profile/${encodeURIComponent(sourceHandle)}/following?${query}`, "following");
   const page = normalizeFollowingPage(body);
   if (page.accounts.length > FOLLOWING_API_COUNT) throw new Error(`following: upstream returned more than ${FOLLOWING_API_COUNT} accounts`);
-  const accountValues: Array<string | number> = [];
-  const accountIdentityValues: string[] = [];
-  const accountRows = page.accounts.map((account) => {
-    accountIdentityValues.push(account.id, account.handle);
-    accountValues.push(account.id, account.handle, account.name, account.protected ? 1 : 0, marker);
-    return "(?, ?, ?, ?, ?)";
-  }).join(", ");
-  if (accountRows) {
-    const accountIdentityRows = page.accounts.map(() => "(?, ?)").join(", ");
+  for (let offset = 0; offset < page.accounts.length; offset += FOLLOWING_DB_CHUNK) {
+    const accounts = page.accounts.slice(offset, offset + FOLLOWING_DB_CHUNK);
+    const accountIdentityValues = accounts.flatMap((account) => [account.id, account.handle]);
+    const accountValues = accounts.flatMap((account) => [account.id, account.handle, account.name, account.protected ? 1 : 0, marker]);
+    const accountIdentityRows = accounts.map(() => "(?, ?)").join(", ");
+    const accountRows = accounts.map(() => "(?, ?, ?, ?, ?)").join(", ");
     await db.batch([
       db.prepare(`
         WITH incoming(id, handle) AS (VALUES ${accountIdentityRows})
@@ -1059,6 +1092,38 @@ function parseQuote(value: string | null): JsonRecord | null {
   }
 }
 
+function parseDetails(value: string | null): { views: number | null; bookmarks: number | null; media: JsonRecord | null; possiblySensitive: boolean | null } {
+  const details = parseQuote(value);
+  const media = copyObject(details?.media);
+  return {
+    views: asOptionalCount(details?.views),
+    bookmarks: asOptionalCount(details?.bookmarks),
+    media: media && Object.keys(media).length ? media : null,
+    possiblySensitive: typeof details?.possibly_sensitive === "boolean" ? details.possibly_sensitive : null,
+  };
+}
+
+function feedPost(row: DbFeedRow) {
+  const details = parseDetails(row.details_json);
+  return {
+    id: row.id,
+    url: row.url,
+    text: row.text,
+    created_at: new Date(row.created_timestamp * 1000).toISOString(),
+    likes: row.likes,
+    reposts: row.reposts,
+    quotes: row.quotes,
+    replies: row.replies,
+    views: details.views,
+    bookmarks: details.bookmarks,
+    author: { id: row.author_id, screen_name: row.author_screen_name, name: row.author_name },
+    quote: parseQuote(row.quote_json),
+    media: details.media,
+    possibly_sensitive: details.possiblySensitive,
+    source: { kind: row.source_kind, key: row.source_key },
+  };
+}
+
 export async function feed(request: Request, env: RuntimeEnv): Promise<Response> {
   const url = new URL(request.url);
   const pageValue = url.searchParams.get("page") ?? "1";
@@ -1075,7 +1140,7 @@ export async function feed(request: Request, env: RuntimeEnv): Promise<Response>
   const cutoff = Math.floor((generatedAtMs - hours * 60 * 60 * 1000) / 1000);
   const rows = await env.DB.prepare(`
     SELECT id, url, text, created_timestamp, likes, reposts, quotes, replies,
-      author_id, author_screen_name, author_name, quote_json, source_kind, source_key
+      author_id, author_screen_name, author_name, quote_json, details_json, source_kind, source_key
     FROM posts
     WHERE created_timestamp >= ?
     ORDER BY created_timestamp DESC, id DESC
@@ -1086,19 +1151,100 @@ export async function feed(request: Request, env: RuntimeEnv): Promise<Response>
     page,
     limit,
     hours,
-    posts: rows.results.map((row) => ({
-      id: row.id,
-      url: row.url,
-      text: row.text,
-      created_at: new Date(row.created_timestamp * 1000).toISOString(),
-      likes: row.likes,
-      reposts: row.reposts,
-      quotes: row.quotes,
-      replies: row.replies,
-      author: { id: row.author_id, screen_name: row.author_screen_name, name: row.author_name },
-      quote: parseQuote(row.quote_json),
-      source: { kind: row.source_kind, key: row.source_key },
-    })),
+    posts: rows.results.map(feedPost),
+  });
+}
+
+function requiredLikes(ageHours: number): number {
+  return Math.max(10, Math.ceil(Math.min(ageHours, 24) * 100 / 24));
+}
+
+function candidateFor(row: DbFeedRow, generatedAtMs: number) {
+  const post = feedPost(row);
+  const ageHours = Math.max(0, (generatedAtMs / 1000 - row.created_timestamp) / 3600);
+  const minimumLikes = requiredLikes(ageHours);
+  const minimumBookmarks = Math.max(5, Math.ceil(minimumLikes / 4));
+  const followingMinimum = Math.max(10, Math.ceil(minimumLikes / 2));
+  const eligible = row.likes >= minimumLikes ||
+    (post.bookmarks !== null && post.bookmarks >= minimumBookmarks) ||
+    (row.source_kind === "following" && row.likes >= followingMinimum);
+  if (!eligible) return null;
+
+  const signals: string[] = [];
+  if (row.likes >= 100) signals.push("popular");
+  if (post.bookmarks !== null && post.bookmarks >= 40) signals.push("bookmarked_by_many");
+  if (post.media) signals.push("media");
+  if (post.quote) signals.push("quote");
+  if (Array.from(row.text).length >= 120) signals.push("detailed");
+  if (row.source_kind === "following") signals.push("following");
+
+  const engagement = row.likes + row.reposts * 2 + row.quotes * 3 + (post.bookmarks ?? 0) * 3;
+  const formatFactor = 1 + (post.media ? 0.15 : 0) + (post.quote ? 0.1 : 0) + (signals.includes("detailed") ? 0.1 : 0);
+  return {
+    ...post,
+    selection: {
+      score: Math.round(Math.log10(engagement + 1) * formatFactor * 100) / 100,
+      signals,
+      minimum_likes_at_collection_age: minimumLikes,
+    },
+  };
+}
+
+export async function candidates(request: Request, env: RuntimeEnv): Promise<Response> {
+  const url = new URL(request.url);
+  const limitValue = url.searchParams.get("limit") ?? "20";
+  const limit = /^\d+$/.test(limitValue) ? Number(limitValue) : NaN;
+  const hours = parsePositiveNumber(url.searchParams.get("hours"), 24);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_CANDIDATE_LIMIT || hours === null) {
+    return json({ error: "invalid_query", message: `limit は1〜${MAX_CANDIDATE_LIMIT}、hours は0より大きい数を指定してください` }, 400);
+  }
+
+  const generatedAtMs = Date.now();
+  const cutoff = Math.floor((generatedAtMs - hours * 60 * 60 * 1000) / 1000);
+  // ponytail: scan the strongest 1,000 rows; move JSON-aware scoring into SQL only if daily volume hides candidates.
+  const scanLimit = Math.min(MAX_CANDIDATE_SCAN, Math.max(200, limit * 20));
+  const rows = await env.DB.prepare(`
+    SELECT id, url, text, created_timestamp, likes, reposts, quotes, replies,
+      author_id, author_screen_name, author_name, quote_json, details_json, source_kind, source_key
+    FROM posts
+    WHERE created_timestamp >= ?
+    ORDER BY (likes + reposts * 2 + quotes * 3) DESC, created_timestamp DESC, id DESC
+    LIMIT ?
+  `).bind(cutoff, scanLimit).all<DbFeedRow>();
+  const ranked = rows.results
+    .map((row) => candidateFor(row, generatedAtMs))
+    .filter((post) => post !== null)
+    .sort((left, right) => right.selection.score - left.selection.score || right.created_at.localeCompare(left.created_at));
+  const selected: typeof ranked = [];
+  const deferred: typeof ranked = [];
+  const authors = new Set<string>();
+  const sources = new Set<string>();
+  for (const post of ranked) {
+    const source = `${post.source.kind}:${post.source.key}`;
+    if (authors.has(post.author.screen_name) || sources.has(source)) {
+      deferred.push(post);
+      continue;
+    }
+    selected.push(post);
+    authors.add(post.author.screen_name);
+    sources.add(source);
+    if (selected.length === limit) break;
+  }
+  selected.push(...deferred.slice(0, limit - selected.length));
+
+  return json({
+    generated_at: new Date(generatedAtMs).toISOString(),
+    hours,
+    limit,
+    evaluated: rows.results.length,
+    criteria: {
+      search_minimum_likes_at_24h: 100,
+      recent_minimum_likes: 10,
+      bookmarks_can_qualify: true,
+      following_threshold_ratio: 0.5,
+      diversify_author_and_source_before_backfill: true,
+    },
+    posts: selected,
   });
 }
 
@@ -1107,6 +1253,7 @@ const worker = {
     try {
       const url = new URL(request.url);
       if (request.method === "GET" && url.pathname === "/feed") return await feed(request, env);
+      if (request.method === "GET" && url.pathname === "/candidates") return await candidates(request, env);
       if (url.pathname === "/queries") return await manageQueries(request, env);
       return json({ error: "not_found" }, 404);
     } catch (error) {
