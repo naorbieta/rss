@@ -1,0 +1,74 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "rss-curator",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-31",
+  "compatibility_flags": ["no_nodejs_compat", "no_nodejs_compat_v2", "global_fetch_strictly_public"],
+  "vars": {
+    "SOURCE_HANDLE": "",
+    // ローカルではlocalhostだけを許可します。本番値はenv.productionに設定します。
+    "MCP_ALLOWED_HOST": ""
+  },
+  "secrets": {
+    "required": ["ADMIN_TOKEN"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "rss-curator",
+      "database_id": "6be2b4a2-f5ea-4a67-aa5f-860c939da0e1",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "c25f4a67202a4ced8be9c4086fbc56fc"
+    }
+  ],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "env": {
+    "production": {
+      "name": "rss-curator",
+      "workers_dev": true,
+      "preview_urls": false,
+      "vars": {
+        "SOURCE_HANDLE": "naorbieta",
+        "MCP_ALLOWED_HOST": "rss-curator.nao-a01.workers.dev"
+      },
+      "secrets": {
+        "required": ["ADMIN_TOKEN"]
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "rss-curator",
+          "database_id": "6be2b4a2-f5ea-4a67-aa5f-860c939da0e1",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "kv_namespaces": [
+        {
+          "binding": "OAUTH_KV",
+          "id": "c25f4a67202a4ced8be9c4086fbc56fc"
+        }
+      ],
+      "triggers": {
+        "crons": ["*/5 * * * *"]
+      }
+    }
+  }
+}

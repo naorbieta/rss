@@ -1,0 +1,24 @@
+{
+  "name": "rss-curator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "FxEmbed の投稿を D1 に同期し、ChatGPTへMCPで提供するWorker",
+  "type": "module",
+  "scripts": {
+    "types": "wrangler types",
+    "typecheck": "wrangler types && tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.1.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.127.1"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.10.3",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "zod": "^4.5.4"
+  }
+}
