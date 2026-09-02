@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import worker, { collectOnce, normalizeStatus, syncFollowingPage } from "../src/index";
+import worker, { collectOnce, normalizeAccount, normalizeStatus, syncFollowingPage } from "../src/index";
 
 const db = env.DB;
 const runtimeEnv = { DB: db, SOURCE_HANDLE: "" };
@@ -102,6 +102,12 @@ afterAll(() => {
 });
 
 describe("FxEmbed collector", () => {
+  it("requires a stable ID for following accounts", () => {
+    expect(normalizeAccount({ screen_name: "alice", name: "Alice" })).toBeNull();
+    expect(normalizeAccount({ id: Number.MAX_SAFE_INTEGER + 1, screen_name: "alice", name: "Alice" })).toBeNull();
+    expect(normalizeAccount({ id: "a", screen_name: "alice", name: "Alice" })?.id).toBe("a");
+  });
+
   it("normalizes a status and keeps quote data as an object", () => {
     const status = normalizeStatus({
       id: "100",
@@ -510,6 +516,21 @@ describe("FxEmbed collector", () => {
     await syncFollowingPage(db, "source", 1_700_000_101_000);
     expect((await db.prepare("SELECT handle FROM accounts ORDER BY handle").all<{ handle: string }>()).results.map((row) => row.handle)).toEqual(["alice", "bob"]);
     expect((await db.prepare("SELECT value FROM collector_state WHERE key = ?").bind("following_sync_at").first<{ value: string }>())?.value).toBe("2023-11-14T22:15:01.000Z");
+  });
+
+  it("does not let protected accounts consume the status polling slot", async () => {
+    await db.batch([
+      db.prepare("INSERT INTO accounts (id, handle, name, protected) VALUES (?, ?, ?, ?)").bind("private", "aaa_private", "Private", 1),
+      db.prepare("INSERT INTO accounts (id, handle, name, protected) VALUES (?, ?, ?, ?)").bind("public", "bbb_public", "Public", 0),
+    ]);
+    await markFollowingAsCurrent();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      expect(new URL(String(input)).pathname).toBe("/2/profile/bbb_public/statuses");
+      return new Response(null, { status: 204 });
+    });
+
+    expect((await collectOnce(accountRuntimeEnv, 1_700_000_100_000)).accounts).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("resumes account status pagination with its fixed since checkpoint", async () => {

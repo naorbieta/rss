@@ -250,10 +250,11 @@ export function normalizeStatus(value: unknown): ApiStatus | null {
 
 export function normalizeAccount(value: unknown): ApiAccount | null {
   if (!isRecord(value)) return null;
+  const id = asId(value.id);
   const handle = asString(value.screen_name ?? value.screenName ?? value.username);
-  if (!handle) return null;
+  if (!id || !handle) return null;
   return {
-    id: asId(value.id) ?? handle,
+    id,
     handle,
     name: asString(value.name) ?? handle,
     protected: value.protected === true || value.protected === 1 || value.is_protected === true,
@@ -824,7 +825,7 @@ export async function syncFollowingPage(db: D1Database, sourceHandle: string, no
 async function listAccountsForRun(db: D1Database): Promise<{ all: DbAccount[]; selected: DbAccount[]; start: number }> {
   const rows = await db.prepare(`
     SELECT id, handle, name, protected, last_post_timestamp, last_checked_at
-    FROM accounts ORDER BY handle COLLATE NOCASE, id
+    FROM accounts WHERE protected = 0 ORDER BY handle COLLATE NOCASE, id
   `).all<DbAccount>();
   const all = rows.results;
   if (!all.length) return { all, selected: [], start: 0 };
@@ -839,9 +840,6 @@ async function collectAccountStatuses(db: D1Database, nowMs: number): Promise<nu
   if (!all.length) return 0;
   const checkedAt = new Date(nowMs).toISOString();
   for (const account of selected) {
-    if (account.protected) {
-      continue;
-    }
     try {
       const checkpoint = await readAccountStatusCheckpoint(db, account.id);
       const since = checkpoint?.since ?? account.last_post_timestamp;

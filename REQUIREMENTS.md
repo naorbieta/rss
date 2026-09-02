@@ -41,7 +41,7 @@ npx wrangler d1 migrations apply rss-curator --remote --env production
 npx wrangler deploy --env production
 ```
 
-上記の確認はすべて成功しました。一時 local state へ migration を適用し、同じ D1 エンジンの schema を確認しています。自動テスト69件には、OAuthの認可からMCPの3ツール呼び出しまでの統合確認、同時認可でもstateを一度だけ消費する確認、同じブラウザで並行した認可を維持する確認、未完了認可stateの上限、本番hostの正規Origin許可と悪性Origin拒否、本番の確認用JSON APIをD1アクセス前に拒否する確認、途中まで保存されたfollowing設定を元へ戻した際の再同期と収集再開、account backlogのcursor循環防止、無関係な配列だけを含むfollowing応答の拒否を含みます。FxEmbed の実通信では following 71件を同期し、公開70件の投稿を収集、protected 1件を取得対象外として確認しました。実APIで `count` 指定より多い投稿と `0|` で始まる最終cursorを検出し、分割保存と完了判定へ反映しています。検索語8件も一巡し、ローカルD1には合計1,355投稿を保存しました。
+上記の確認はすべて成功しました。一時 local state へ migration を適用し、同じ D1 エンジンの schema を確認しています。自動テスト71件には、OAuthの認可からMCPの3ツール呼び出しまでの統合確認、同時認可でもstateを一度だけ消費する確認、同じブラウザで並行した認可を維持する確認、未完了認可stateの上限、本番hostの正規Origin許可と悪性Origin拒否、本番の確認用JSON APIをD1アクセス前に拒否する確認、途中まで保存されたfollowing設定を元へ戻した際の再同期と収集再開、account backlogのcursor循環防止、無関係な配列だけを含むfollowing応答の拒否、protected accountを除外したstatus巡回、stable IDのないfollowing accountの拒否を含みます。FxEmbed の実通信では following 71件を同期し、公開70件の投稿を収集、protected 1件を取得対象外として確認しました。実APIで `count` 指定より多い投稿と `0|` で始まる最終cursorを検出し、分割保存と完了判定へ反映しています。検索語8件も一巡し、ローカルD1には合計1,355投稿を保存しました。
 
 本番D1へmigrationを適用し、KVとWorkers Secretを設定したWorkerを `https://rss-curator.nao-a01.workers.dev` へ配置しました。未認証アクセスの拒否、Bearer認証、OAuth discovery、ChatGPTからの検索語取得と推薦候補取得を確認しています。毎日8:00（日本時間）の定期タスクを作成し、「今すぐ実行」でもMCPを呼び出して推薦結果が返ることを確認しました。
 
