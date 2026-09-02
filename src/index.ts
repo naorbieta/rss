@@ -1524,14 +1524,14 @@ async function approve(request: Request, env: WorkerEnv): Promise<Response> {
   if (!await secretsMatch(csrf, stored.csrf)) {
     return oauthHtml("<h1>接続要求を確認できません</h1>", 400);
   }
+  if (!env.ADMIN_TOKEN) return oauthHtml("<h1>ADMIN_TOKENが設定されていません</h1>", 500);
+  if (!await secretsMatch(form.get("token") ?? "", env.ADMIN_TOKEN)) {
+    return oauthHtml("<h1>管理トークンが違います</h1>", 401);
+  }
   const consumed = await env.DB.prepare("DELETE FROM collector_state WHERE key = ? AND value = ? AND updated_at >= ? RETURNING key")
     .bind(stateKey, storedText, cutoff).first<{ key: string }>();
   if (!consumed) {
     return oauthHtml("<h1>接続要求の有効期限が切れました</h1><p>ChatGPTから接続をやり直してください。</p>", 400);
-  }
-  if (!env.ADMIN_TOKEN) return oauthHtml("<h1>ADMIN_TOKENが設定されていません</h1>", 500);
-  if (!await secretsMatch(form.get("token") ?? "", env.ADMIN_TOKEN)) {
-    return oauthHtml("<h1>管理トークンが違います</h1>", 401);
   }
   const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
     request: stored.request,

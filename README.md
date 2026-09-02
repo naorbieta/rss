@@ -21,23 +21,17 @@ SOURCE_HANDLE=your_handle
 
 Workersへ配置するときは、同じ名前の `ADMIN_TOKEN` を Workers Secret として設定します。平文の `vars` には置きません。Wrangler の設定値を変更したら `npm run types` をもう一度実行してください。
 
-## 本番へ配置する前に
+## 本番へ配置する
 
-`wrangler.jsonc` の `database_id` はローカル用の仮のIDです。本番用の新しいD1を作る場合は、次の準備をしてから配置します。
+`env.production` には作成済みのD1、KV、公開hostが設定されています。再配置は次の3コマンドです。
 
 ```sh
-npx wrangler d1 create rss-curator
-# 表示された database_id を wrangler.jsonc に設定する
-npx wrangler kv namespace create OAUTH_KV
-# 表示された id を wrangler.jsonc の OAUTH_KV に設定する
-npx wrangler d1 migrations apply rss-curator --remote
-npx wrangler secret put ADMIN_TOKEN
-# wrangler.jsonc の vars.SOURCE_HANDLE に対象アカウントを設定する
-# vars.MCP_ALLOWED_HOST に rss-curator.<subdomain>.workers.dev など、公開URLのhostnameだけを設定する
-npx wrangler deploy
+npx wrangler d1 migrations apply rss-curator --remote --env production
+npx wrangler secret put ADMIN_TOKEN --env production
+npx wrangler deploy --env production
 ```
 
-既存のリモートD1を使う場合は、先にexportなどでバックアップを取得して内容を確認してから、`migrations apply --remote` を実行してください。
+本番URLは `https://rss-curator.nao-a01.workers.dev` です。既存のリモートD1へ新しいmigrationを適用する場合は、先にexportなどでバックアップを取得して内容を確認してください。
 
 ## 検索語を管理する
 
@@ -140,13 +134,17 @@ Inspectorに `http://127.0.0.1:8787/mcp` を指定し、OAuthの認可画面で 
 
 未完了の認可要求は全体で20件まで保持します。上限を超えると429を返すため、開いている認可を完了するか、10分後にやり直してください。
 
-ChatGPTから利用するには、Workerを配置して公開HTTPS URLを用意します。ChatGPTの「設定」→「Security and login」でDeveloper modeを有効にし、[ChatGPT Plugins](https://chatgpt.com/plugins) の追加ボタンから `https://<WorkerのURL>/mcp` を登録します。表示された認可画面に `ADMIN_TOKEN` を入力し、新しい会話のツールメニューでこの接続を有効にします。Developer modeの利用可否はアカウントやワークスペースの設定に依存します。詳しい画面手順は[OpenAI公式の接続手順](https://developers.openai.com/plugins/deploy/connect-chatgpt)を参照してください。
+ChatGPTの「設定」→「Security and login」でDeveloper modeを有効にし、[ChatGPT Plugins](https://chatgpt.com/plugins) の追加ボタンから `https://rss-curator.nao-a01.workers.dev/mcp` を登録します。表示された認可画面に `ADMIN_TOKEN` を入力し、新しい会話のツールメニューでこの接続を有効にします。Developer modeの利用可否はアカウントやワークスペースの設定に依存します。詳しい画面手順は[OpenAI公式の接続手順](https://developers.openai.com/api/docs/guides/developer-mode#how-to-use)を参照してください。
 
 `ADMIN_TOKEN` はWorkerの認可画面だけに入力し、会話本文へは貼り付けません。会話では、たとえば次のように依頼できます。
 
 > 今日の推薦候補を見て、検索語の一致だけで選ばず、具体性、意外性、実用性、人間への洞察、画像の内容から読む価値のある投稿だけ教えて。なければ「該当なし」でよい。
 
 > 今の検索語を見せて。「Cloudflare Workers」「地方鉄道」「プロダクトデザイン」に置き換えて。
+
+定期実行する場合は、手動で同じ依頼が成功することを確認してから、次のように依頼します。
+
+> 毎日午前8時（日本時間）に、Xおすすめの `get_recommendation_candidates` を使って直近24時間の候補を確認して。読む価値のある投稿だけURL付きで最大5件、なければ「今日は該当なし」と報告して。
 
 Worker は反応数と投稿形式による足切りまで担当します。内容が本当に面白いか、推薦理由、候補が0件でよいかは ChatGPT が判断します。Worker は ML、embedding、OpenAI API を使いません。
 

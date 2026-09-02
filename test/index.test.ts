@@ -1745,6 +1745,8 @@ describe("ChatGPT MCP connector", () => {
     expect(csrfRejected.status).toBe(400);
     const rejected = await worker.fetch(approvalRequest(pending, "wrong"), oauthEnv);
     expect(rejected.status).toBe(401);
+    const retried = await worker.fetch(approvalRequest(pending, "test-admin-token"), oauthEnv);
+    expect(retried.status).toBe(302);
     const replayed = await worker.fetch(approvalRequest(pending, "test-admin-token"), oauthEnv);
     expect(replayed.status).toBe(400);
 
