@@ -1917,13 +1917,14 @@ describe("candidates", () => {
     expect(response.status).toBe(200);
     const body = await response.json() as {
       criteria: { search_minimum_likes_at_24h: number };
-      posts: Array<{ id: string; bookmarks: number | null; views: number | null; media: unknown; selection: { signals: string[] } }>;
+      posts: Array<{ id: string; bookmarks: number | null; views: number | null; media: unknown; selection: { signals: string[]; minimum_likes_required: number } }>;
     };
     expect(body.criteria.search_minimum_likes_at_24h).toBe(100);
     expect(body.posts.map((post) => post.id)).toEqual(["popular-image", "different", "useful", "followed"]);
     expect(body.posts[0]).toMatchObject({ bookmarks: 500, views: 50_000 });
     expect(body.posts[0].media).toEqual({ photos: [{ type: "photo", url: "https://example.com/popular.jpg", width: 100, height: 100 }] });
     expect(body.posts[0].selection.signals).toEqual(expect.arrayContaining(["popular", "bookmarked_by_many", "media", "quote"]));
+    expect(body.posts.find((post) => post.id === "followed")?.selection.minimum_likes_required).toBe(42);
 
     const diverse = await worker.fetch(new Request("https://localhost/candidates?hours=24&limit=2"), env);
     expect((await diverse.json() as { posts: Array<{ id: string }> }).posts.map((post) => post.id)).toEqual(["popular-image", "different"]);

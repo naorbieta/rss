@@ -1287,7 +1287,7 @@ function candidateFor(row: DbFeedRow, generatedAtMs: number) {
     selection: {
       score: Math.round(Math.log10(engagement + 1) * formatFactor * 100) / 100,
       signals,
-      minimum_likes_at_collection_age: minimumLikes,
+      minimum_likes_required: row.source_kind === "following" ? followingMinimum : minimumLikes,
     },
   };
 }
